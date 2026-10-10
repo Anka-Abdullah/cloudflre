@@ -181,6 +181,13 @@ Blok "verdict" merangkum ketiganya dan mencetak saran konfigurasi:
 Exit code: 0 = dialog bekerja, 1 = dialog gagal, 2 = tidak ada API key.
 Tambahkan --json untuk ringkasan yang bisa dibaca mesin.
 
+Hasil live (FASE 3): native tool calling AKTIF, jadi AI_TOOLS_MODE=native.
+Model mengirim reasoning_content - diabaikan, tidak pernah ke customer.
+Budget: AI_MAX_TOKENS=2048 (sementara). max_tokens 128 terbukti terlalu kecil:
+jawaban datang kosong dengan finish_reason "length" dan tampak seperti model
+tidak sanggup, padahal hanya terpotong. Skrip kini mengulang sekali dengan
+budget 2x sebelum menyimpulkan gagal.
+
 Arti penting untuk FASE 3: bila native tool calling tidak tersedia, agent WAJIB
 punya jalur JSON mode. Uji ini yang menentukan jalur mana yang dipakai, bukan
 asumsi. Sampai FASE 3 mendarat, pipeline tidak memanggil AI sama sekali

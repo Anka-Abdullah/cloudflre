@@ -36,6 +36,9 @@ export interface Env {
   AI_MODEL?: string;
   AI_TIMEOUT_MS?: string;
   AI_MAX_TURNS?: string;
+  AI_MAX_TOKENS?: string;
+  AI_TOOLS_MODE?: string;
+  AI_JSON_FALLBACK?: string;
   KNOWLEDGE_MODE?: string;
   KNOWLEDGE_INLINE_MAX_BYTES?: string;
   KNOWLEDGE_TOP_K?: string;
@@ -115,6 +118,8 @@ export type RelayMode = "relay" | "observe";
 export type BotMode = "off" | "shadow" | "on";
 export type KnowledgeMode = "auto" | "kv_inline" | "r2_d1_fts";
 export type PaymentProviderName = "sumopod";
+/** How the agent asks the model for tools. */
+export type AiToolsMode = "native" | "json";
 
 export interface BotConfig {
   mode: BotMode;
@@ -125,6 +130,17 @@ export interface BotConfig {
   aiApiKey: string;
   aiTimeoutMs: number;
   aiMaxTurns: number;
+  /**
+   * Output budget per model call. 128 was far too small: this model is a
+   * reasoning model, so a small budget is spent on the private scratchpad before
+   * any answer is emitted, and the reply comes back empty with
+   * `finish_reason: "length"` (work order FASE 3, step 2).
+   */
+  aiMaxTokens: number;
+  /** `native` = send a `tools` array; `json` = describe tools in the prompt. */
+  aiToolsMode: AiToolsMode;
+  /** Keep the JSON-mode parser available as a fallback even in native mode. */
+  aiJsonFallback: boolean;
   knowledgeMode: KnowledgeMode;
   knowledgeInlineMaxBytes: number;
   knowledgeTopK: number;
@@ -227,6 +243,9 @@ function loadBotConfig(env: Env): BotConfig {
     aiApiKey: trimmed(env.AI_API_KEY),
     aiTimeoutMs: intVar("AI_TIMEOUT_MS", env.AI_TIMEOUT_MS, 60_000, 1_000, 300_000),
     aiMaxTurns: intVar("AI_MAX_TURNS", env.AI_MAX_TURNS, 3, 1, 10),
+    aiMaxTokens: intVar("AI_MAX_TOKENS", env.AI_MAX_TOKENS, 2_048, 64, 32_768),
+    aiToolsMode: enumVar("AI_TOOLS_MODE", env.AI_TOOLS_MODE, ["native", "json"] as const, "native"),
+    aiJsonFallback: boolVar("AI_JSON_FALLBACK", env.AI_JSON_FALLBACK, true),
     knowledgeMode: enumVar(
       "KNOWLEDGE_MODE",
       env.KNOWLEDGE_MODE,
@@ -329,6 +348,11 @@ export interface BotReadiness {
  * queue consumer, so a half-provisioned number logs one clear reason instead of
  * throwing per event.
  *
+ * The AI is considered ready only when it can actually be called: base URL,
+ * model, key, *and* a usable output budget. `aiMaxTokens` is included because a
+ * budget of 0 (or a nonsensical one) makes every call return an empty truncated
+ * answer — a configuration fault that used to look like a model fault.
+ *
  * `BOT_MODE=off` never consults this: relay behaviour must survive a number that
  * has no D1/KV/DO bindings at all.
  */
@@ -340,6 +364,7 @@ export function botReadiness(config: InstanceConfig, env: Pick<Env, "BOT_DB" | "
   if (bot.aiBaseUrl === "") missing.push("AI_BASE_URL");
   if (bot.aiModel === "") missing.push("AI_MODEL");
   if (bot.aiApiKey === "") missing.push("AI_API_KEY");
+  if (bot.aiMaxTokens <= 0) missing.push("AI_MAX_TOKENS");
 
   const missingBindings: string[] = [];
   if (!env.BOT_DB) missingBindings.push("BOT_DB");

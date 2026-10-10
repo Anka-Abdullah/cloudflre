@@ -19,6 +19,7 @@ export { createWorker } from "./worker";
 export { isDlqQueue, resolveConfig } from "./support";
 export { ConfigError, botReadiness, loadConfig } from "./config";
 export type {
+  AiToolsMode,
   BotConfig,
   BotMode,
   BotReadiness,

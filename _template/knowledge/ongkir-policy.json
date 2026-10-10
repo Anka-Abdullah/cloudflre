@@ -1,0 +1,6 @@
+{
+  "_comment": "Template contoh: disalin ke <nomor>/knowledge/ongkir-policy.json.",
+  "version": 1,
+  "default": "admin",
+  "products": {}
+}

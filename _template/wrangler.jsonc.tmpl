@@ -54,6 +54,15 @@
     "AI_MODEL": "cmc/deepseek/deepseek-v4.1-flash",
     "AI_TIMEOUT_MS": "60000",
     "AI_MAX_TURNS": "3",
+    // Output budget per model call. This model is a reasoning model: a small
+    // budget (128) is spent on its private reasoning_content before any answer
+    // is emitted, so the reply arrives empty with finish_reason "length".
+    "AI_MAX_TOKENS": "2048",
+    // native: send a tools array (proven working by the FASE 3 smoke test).
+    // json:   describe the tools in the prompt and parse JSON back.
+    "AI_TOOLS_MODE": "native",
+    // Keep the JSON-mode parser wired up as a fallback even in native mode.
+    "AI_JSON_FALLBACK": "true",
     // auto → kv_inline while knowledge.txt fits KNOWLEDGE_INLINE_MAX_BYTES,
     // otherwise r2_d1_fts (D1 FTS5 + bm25, verified available).
     "KNOWLEDGE_MODE": "auto",

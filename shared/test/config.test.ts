@@ -153,3 +153,67 @@ describe("botReadiness", () => {
     expect(readiness.missingBindings).toEqual(["BOT_DB", "CHAT_COORDINATOR"]);
   });
 });
+
+describe("loadConfig — AI agent settings (FASE 3)", () => {
+  it("defaults to native tools with a budget large enough for a reasoning model", () => {
+    // 128 was proven too small by the smoke test: the model spends the budget on
+    // reasoning_content and returns empty content with finish_reason "length".
+    expect(loadConfig(envOf()).bot.aiMaxTokens).toBe(2_048);
+    expect(loadConfig(envOf()).bot.aiToolsMode).toBe("native");
+    expect(loadConfig(envOf()).bot.aiJsonFallback).toBe(true);
+  });
+
+  it.each([
+    ["native", "native"],
+    ["json", "json"],
+    ["NATIVE", "native"],
+  ])("accepts AI_TOOLS_MODE=%s", (raw, expected) => {
+    expect(loadConfig(envOf({ AI_TOOLS_MODE: raw })).bot.aiToolsMode).toBe(expected);
+  });
+
+  it("rejects an unknown AI_TOOLS_MODE instead of silently defaulting", () => {
+    expect(() => loadConfig(envOf({ AI_TOOLS_MODE: "function_calling" }))).toThrow(/AI_TOOLS_MODE must be one of native, json/);
+  });
+
+  it.each([
+    ["64", 64],
+    ["2048", 2_048],
+    ["32768", 32_768],
+  ])("accepts AI_MAX_TOKENS=%s", (raw, expected) => {
+    expect(loadConfig(envOf({ AI_MAX_TOKENS: raw })).bot.aiMaxTokens).toBe(expected);
+  });
+
+  it("rejects an output budget that cannot produce an answer", () => {
+    expect(() => loadConfig(envOf({ AI_MAX_TOKENS: "0" }))).toThrow(/AI_MAX_TOKENS must be between 64 and 32768/);
+    expect(() => loadConfig(envOf({ AI_MAX_TOKENS: "128.5" }))).toThrow(/AI_MAX_TOKENS must be an integer/);
+    expect(() => loadConfig(envOf({ AI_MAX_TOKENS: "999999" }))).toThrow(/AI_MAX_TOKENS must be between/);
+  });
+
+  it.each([
+    ["true", true],
+    ["false", false],
+  ])("parses AI_JSON_FALLBACK=%s", (raw, expected) => {
+    expect(loadConfig(envOf({ AI_JSON_FALLBACK: raw })).bot.aiJsonFallback).toBe(expected);
+  });
+
+  it("flags an unusable output budget in botReadiness", () => {
+    const config = loadConfig(
+      envOf({
+        WUZAPI_API_BASE: "https://wa.example.com",
+        WUZAPI_TOKEN: "token",
+        AI_BASE_URL: "https://ai.example.com/v1",
+        AI_MODEL: "model",
+        AI_API_KEY: "key",
+      }),
+    );
+    // loadConfig already rejects out-of-range values, so this guards configs built
+    // in code (tests, future callers) rather than a var an operator can set.
+    const broken = { ...config, bot: { ...config.bot, aiMaxTokens: 0 } };
+    const readiness = botReadiness(broken, {
+      BOT_DB: {} as D1Database,
+      CHAT_COORDINATOR: {} as DurableObjectNamespace,
+    });
+    expect(readiness.ready).toBe(false);
+    expect(readiness.missing).toEqual(["AI_MAX_TOKENS"]);
+  });
+});

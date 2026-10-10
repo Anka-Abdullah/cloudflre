@@ -461,9 +461,40 @@ Yang TERBUKTI dari probe itu:
     karena endpoint berada di /v1/models dan /v1/chat/completions;
   - endpoint menolak permintaan tanpa kredensial dengan 401 yang rapi.
 
-Yang BELUM terbukti (butuh AI_API_KEY, lihat checklist di runbook bagian 4):
-  - apakah Authorization: Bearer <key> adalah skema yang diterima;
-  - balasan teks, native tool calling, dan response_format json_object.
+HASIL SMOKE TEST LIVE (dijalankan pemilik proyek, dilaporkan di work order
+FASE 3; skripnya sudah diperkuat agar hasil ini reprodusibel):
+  - Authorization: Bearer <key> DITERIMA;
+  - balasan teks: OK;
+  - NATIVE TOOL CALLING: AKTIF -> AI_TOOLS_MODE=native (bukan fallback JSON);
+  - response_format json_object: tersedia (tetap dipakai sebagai cadangan);
+  - model mengirim message.reasoning_content -> WAJIB DIABAIKAN. Nilai itu
+    adalah coretan internal model, bukan jawaban, dan tidak pernah boleh
+    dikirim ke customer maupun dimasukkan ke history percakapan.
+
+CATATAN MAX_TOKENS (temuan penting dari smoke test):
+  max_tokens 128 (dan 32) TERLALU KECIL. Model ini model reasoning: ia
+  menghabiskan budget pada reasoning_content sebelum sempat menulis jawaban,
+  sehingga respons datang dengan finish_reason "length" dan content KOSONG.
+  Gejalanya menyesatkan - seolah model tidak sanggup memanggil tool, padahal
+  hanya terpotong. Karena itu:
+    - AI_MAX_TOKENS default 2048 (sementara; bisa dinaikkan bila perlu);
+    - smoke-ai.mjs memakai budget 64 / 2048 / 1024 per probe dan, bila
+      finish_reason == "length" dengan hasil kosong, mengulang SEKALI dengan
+      budget 2x sebelum menyimpulkan gagal (jadi "inconclusive", bukan
+      "capability fail");
+    - kelengkapan tool dinilai dari tool_calls, BUKAN dari content, karena
+      content memang null sah saat model memanggil tool;
+    - botReadiness() ikut memeriksa AI_MAX_TOKENS supaya budget 0 tidak
+      tampak seperti model yang rusak.
+
+URUTAN SUMBER AI_API_KEY di smoke-ai.mjs (diperbaiki di FASE 3):
+  --api-key -> $AI_API_KEY -> cloudflare/.dev.vars -> <nomor>/.dev.vars
+  Berkas root didahulukan KARENA berkas per-nomor memuat placeholder
+  "dev-ai-key-change-me"; sebelumnya placeholder itu menang dan membuat key
+  asli tidak terpakai. Nilai yang mirip placeholder (dev-, test-, change-me,
+  your-, xxx, example.com) sekarang dilewati, dan bila hanya placeholder yang
+  ditemukan, skrip memberi tahu berkas mana yang diabaikan lalu keluar dengan
+  kode 2.
 
 Konsekuensi untuk FASE 3: klien AI harus menangani DUA bentuk error - bentuk
 OpenAI standar {"error":{"message":...}} dan bentuk ringkas yang dipakai
