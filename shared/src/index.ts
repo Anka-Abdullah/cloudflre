@@ -98,5 +98,49 @@ export {
   handleWuzapiEvent,
 } from "./bot/queue/handlers";
 export type { BotDeps, BotRuntime, BotRuntimeOptions, Disposition } from "./bot/queue/handlers";
+export {
+  DEFAULT_CHUNK_OVERLAP,
+  DEFAULT_CHUNK_SIZE,
+  chunkText,
+  contentHash,
+} from "./bot/knowledge/chunker";
+export type { Chunk, ChunkOptions } from "./bot/knowledge/chunker";
+export {
+  KNOWLEDGE_KEYS,
+  invalidateKnowledgeCache,
+  loadKnowledge,
+  loadOngkirPolicy,
+  resolveKnowledgeMode,
+} from "./bot/knowledge/loader";
+export type { KnowledgeBundle, KnowledgeSource, LoadKnowledgeOptions } from "./bot/knowledge/loader";
+export {
+  NO_CONTEXT_INTRO,
+  buildMatchQuery,
+  chunksFor,
+  ensureFtsSchema,
+  invalidateChunkCache,
+  retrieve,
+  scoreChunk,
+  searchInMemory,
+  tokenize,
+} from "./bot/knowledge/search";
+export type { KnowledgeHit, RetrievalResult, RetrieveOptions } from "./bot/knowledge/search";
+export {
+  assignOngkirPolicy,
+  isOngkirDecision,
+  parseCatalog,
+  parseRupiah,
+  resolveCatalog,
+  summariseCatalog,
+} from "./bot/knowledge/catalog";
+export type {
+  AssignedPolicy,
+  AssignOptions,
+  CatalogProduct,
+  OngkirDecision,
+  OngkirPolicy,
+  OngkirSource,
+  ResolvedProduct,
+} from "./bot/knowledge/catalog";
 export { WuzapiClient } from "./bot/wuzapi/client";
 export type { WuzapiClientDeps, WuzapiClientOptions, WuzapiSendResult } from "./bot/wuzapi/client";
