@@ -64,7 +64,19 @@ async function runQueue(mode: string, body: EnvelopeV1): Promise<RunResult> {
     now: () => new Date("2026-10-10T08:00:00.000Z"),
     log: (line) => void logs.push(line),
     fetchImpl: (async (input: RequestInfo | URL) => {
-      requests.push(String(input));
+      const url = String(input);
+      requests.push(url);
+      // The pipeline now talks to two services over the same seam: the AI first,
+      // then WuzAPI. Each gets the response shape its own protocol defines, so the
+      // test exercises the real agent -> send chain rather than a fallback.
+      if (url.includes("/chat/completions")) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Halo Kak, ada yang bisa dibantu?" } }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify({ code: 200, success: true, data: { Id: "WA-OUT-1" } }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -108,9 +120,13 @@ describe("BOT_MODE routing", () => {
 
   it("runs the bot pipeline and answers through WuzAPI when BOT_MODE=on", async () => {
     const { logs, requests } = await runQueue("on", envelope("d-on", "628111@s.whatsapp.net"));
+
     expect(requests).not.toContain(RELAY_URL);
-    expect(requests).toEqual(["https://wuzapi.example.test/chat/send/text"]);
+    // The agent asks the model, then sends the answer over WuzAPI.
+    expect(requests).toContain("https://ai.example.test/v1/chat/completions");
+    expect(requests).toContain("https://wuzapi.example.test/chat/send/text");
     expect(events(logs)).toContain("event_received");
+    expect(events(logs)).toContain("ai_call");
     expect(events(logs)).toContain("outbound_sent");
   });
 });

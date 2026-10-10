@@ -87,8 +87,43 @@ export { containsNoAi, namesFromContact, noAiFromContact, resolveChatPolicy, ups
 export type { ChatPolicy, ContactRow, PolicyReason } from "./bot/contacts/policy";
 export { deliverOutbound, describeOutbound, RATE_CAPACITY, RATE_REFILL_PER_SECOND } from "./bot/outbound";
 export type { OutboundContext, OutboundOutcome, SendFailure } from "./bot/outbound";
-export { createResponder, fallbackReply } from "./bot/agent/run";
-export type { AgentOptions, ReplyPlan, Responder } from "./bot/agent/run";
+export {
+  buildMessages,
+  catalogFor,
+  createResponder,
+  fallbackReply,
+  invalidateCatalogCache,
+  runAgentLoop,
+} from "./bot/agent/run";
+export type { AgentLoopOptions, AgentOptions, AgentTurnInput, ReplyPlan, Responder } from "./bot/agent/run";
+export { LlmClient } from "./bot/agent/llm";
+export type { LlmClientOptions, LlmMessage, LlmResult, LlmToolCall, LlmToolDefinition } from "./bot/agent/llm";
+export {
+  CATALOG_MAX_CHARS,
+  CATALOG_MAX_PRODUCTS,
+  DEFAULT_BOT_PROMPT,
+  FORBIDDEN_PATTERNS,
+  HISTORY_MAX_CHARS,
+  buildSystemPrompt,
+  checkForbidden,
+  describeProduct,
+  renderCatalog,
+} from "./bot/agent/prompt";
+export type { PromptContext } from "./bot/agent/prompt";
+export { IMAGE_PREFIX, TOOL_DEFINITIONS, executeTool, parseArguments, toBase64 } from "./bot/agent/tools";
+export type { ToolContext, ToolOutcome } from "./bot/agent/tools";
+export {
+  addItem,
+  cartToCustomer,
+  cartToPrompt,
+  clearCart,
+  findProduct,
+  limitsOf,
+  readCart,
+  removeItem,
+} from "./bot/sales/cart.service";
+export type { CartLimits, CartLine, CartOutcome, CartView } from "./bot/sales/cart.service";
+export { formatRupiah, formatWib, formatWibShort, orderReference, truncate } from "./bot/utils/format";
 export { handleBotBatch } from "./bot/queue/router";
 export type { BotBatchOptions } from "./bot/queue/router";
 export {

@@ -101,7 +101,13 @@ export function createBotRuntime(options: BotRuntimeOptions): BotRuntime {
     client,
     responder:
       deps.responder ??
-      createResponder({ slug: config.slug, maxTurns: config.bot.aiMaxTurns, log }),
+      createResponder({
+        env,
+        config,
+        log,
+        ...(deps.fetchImpl ? { deps: { fetchImpl: deps.fetchImpl } } : {}),
+        ...(deps.sleep ? { deps: { ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}), sleep: deps.sleep } } : {}),
+      }),
     sleep: deps.sleep ?? defaultSleep,
     sendDlq: deps.sendDlq ?? ((record: DlqRecord) => env.DLQ.send(record, { contentType: "json" })),
   };
