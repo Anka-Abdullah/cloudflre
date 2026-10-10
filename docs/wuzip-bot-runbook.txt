@@ -521,8 +521,10 @@ wuzapi + SQLite, tanpa PostgreSQL/RabbitMQ) - lihat wuzapi-local/README.md.
     cloudflare/scripts/sync-knowledge.mjs yang BARU ADA DI FASE 3; sekarang ia
     sengaja berhenti dengan pesan "scripts/sync-knowledge.mjs is not present yet
     (phase 3)" dan menyarankan unggah manual ke KV.
-  - FASE 3: knowledge + AI agent (agent/llm.ts, knowledge/sync.ts,
-    knowledge/search.ts, scripts/sync-knowledge.mjs).
+  - FASE 3: SELESAI (catalog/chunker/loader/search + agent prompt/llm/tools/run,
+    native tool calling dengan fallback JSON, cart.service, assign-ongkir.mjs).
+    Sisa: scripts/sync-knowledge.mjs, sehingga `pnpm run knowledge` belum jalan -
+    unggah manual dengan perintah di README bagian 8 (wajib pakai --config).
   - FASE 4: cart + contacts/sync.ts (tabel carts/cart_items/catalog_products
     sudah ada di migration, belum ada kodenya).
   - FASE 5: Turso + Sumopod + Telegram + outbox flush (+ tabel outbox sudah ada,

@@ -627,6 +627,72 @@ memakai pdf-lib, jadi yang diadopsi dari referensi adalah ATURAN BISNIS dan
 FORMAT, bukan kodenya.
 
 
+6d. FASE 3 - KNOWLEDGE + AI AGENT (SELESAI, TERVERIFIKASI)
+-------------------------------------------------------------------
+Berkas baru: bot/knowledge/{catalog,chunker,loader,search}.ts,
+bot/agent/{prompt,llm,tools,run}.ts, bot/sales/cart.service.ts,
+bot/utils/format.ts, scripts/assign-ongkir.mjs.
+
+a) KATALOG - format nyata, bukan ringkasan rencana
+   Parser membaca 70/70 produk asli tanpa satu pun dilewati. Dua detail yang
+   menentukan: titik dua DIRATAKAN dengan spasi ("Harga          : Rp ..."),
+   sehingga pencocokan "Harga :" gagal TOTAL dan semua harga tampak tidak
+   terbaca; dan SKU/Code kosong di 64 dari 70 produk, jadi kode = Template ID
+   memang wajib (Q26=A). Harga selalu integer, "Rp 1.400.000,00" -> 1400000
+   (koma dipotong, tidak pernah lewat float).
+
+b) ONGKIR - prioritas dan konsekuensinya
+   Baris "Ongkir:" di knowledge.txt > ongkir-policy.json > default admin.
+   Katalog saat ini 0 baris "Ongkir", jadi TANPA policy semua pesanan ke jalur
+   admin. scripts/assign-ongkir.mjs mengisi policy sandbox secara deterministik
+   (mulberry32 + Fisher-Yates, logikanya di catalog.ts supaya ikut diuji):
+   seed sama -> berkas identik; knowledge.txt asli tidak pernah ditulis.
+
+c) KNOWLEDGE MODE dengan data nyata
+   prompt.txt + knowledge.txt = ~73 KB, jauh di bawah
+   KNOWLEDGE_INLINE_MAX_BYTES (1 MB) -> auto memilih kv_inline (dibuktikan di
+   runtime: log "knowledge_loaded source=kv mode=kv_inline"). Jalur r2_d1_fts
+   tetap ada dan diuji dengan bm25 atas tabel FTS5 asli; tabel virtual dibuat
+   lazy oleh ensureFtsSchema, dan kegagalan D1 turun ke skor in-memory
+   (fallback=true) bukan melempar error.
+
+d) AGENT - native tool calling, dengan fallback JSON
+   Loop: system prompt + riwayat -> model -> SEMUA tool call dieksekusi -> hasil
+   dikembalikan -> ulang. Giliran terakhir dikirim TANPA array tools supaya
+   model wajib menjawab prosa. reasoning_content dibuang di klien sehingga
+   secara struktural tidak mungkin ikut terkirim balik (diuji dengan memindai
+   seluruh body request). AI_TOOLS_MODE=json memakai protokol satu-aksi-per-
+   balasan lewat system prompt; bila endpoint menolak array tools (400) dan
+   AI_JSON_FALLBACK aktif, percakapan diulang di mode JSON dengan budget turn
+   baru, sehingga endpoint tanpa native tools tidak mematikan bot.
+
+e) HARGA TIDAK PERNAH DARI MODEL
+   add_to_cart hanya menerima kode + qty; unit_price dibaca dari katalog dan
+   disimpan oleh cart.service. Ada uji eksplisit: model mengirim {"harga":1}
+   dan yang tersimpan tetap 1.400.000. Kode produk selalu divalidasi ke katalog,
+   sehingga produk karangan tidak bisa masuk keranjang.
+
+f) E2E NYATA (wrangler dev + mock AI + mock WuzAPI + knowledge di KV lokal)
+   Mode on  : prompt.txt KV dipakai; katalog tersuntik (100370 & 116964, harga
+              75000 & 1400000, ongkir "termasuk"); 5 native tool; max_tokens
+              2048; reasoning_content tidak bocor; balasan terkirim ke
+              /chat/send/text pada JID pelanggan.
+   Mode shadow: knowledge_loaded -> knowledge_search -> ai_call ->
+              outbound_suppressed_shadow; panggilan WuzAPI TIDAK bertambah
+              sementara panggilan AI bertambah.
+   Catatan operasional: `wrangler kv key put` WAJIB diberi --config
+   <nomor>/wrangler.jsonc; tanpa itu wrangler membaca config root dan gagal
+   dengan "No KV namespaces are configured" (pesan yang menyesatkan).
+
+g) BELUM ADA
+   scripts/sync-knowledge.mjs, sehingga `pnpm run knowledge` masih berhenti
+   dengan pesan bahwa skripnya belum ada. Untuk sekarang unggah manual:
+     wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
+       --remote "knowledge/knowledge.txt" --path <file>
+   (tambahkan --local --persist-to .wrangler/state untuk dev lokal).
+   create_payment_link masih mengembalikan "BELUM tersedia" (FASE 5).
+
+
 7. KEPUTUSAN FASE 0 YANG SUDAH DIBUKTIKAN (FTS5)
 -----------------------------------------------
 Terbukti di runtime D1 (cloudflare/shared/test/d1.test.ts):

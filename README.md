@@ -335,6 +335,30 @@ KNOWLEDGE_KV, CHAT_COORDINATOR — boolean saja) dan `bot.ready` beserta
 `bot.missing` / `bot.missingBindings`. Tidak ada nilai secret yang pernah
 dikembalikan endpoint publik ini.
 
+### Mengunggah prompt & knowledge (sementara manual)
+
+`scripts/sync-knowledge.mjs` belum ada, jadi `pnpm run knowledge` berhenti dengan
+pesan itu. Perintah manual ini sudah diverifikasi bekerja:
+
+```sh
+# produksi
+wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
+  --remote "knowledge/prompt.txt"    --path <nomor>/knowledge/prompt.txt
+wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
+  --remote "knowledge/knowledge.txt" --path <nomor>/knowledge/knowledge.txt
+wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
+  --remote "knowledge/ongkir-policy.json" --path <nomor>/knowledge/ongkir-policy.json
+
+# dev lokal: tambahkan  --local --persist-to .wrangler/state
+```
+
+**`--config <nomor>/wrangler.jsonc` wajib.** Tanpa itu wrangler membaca config
+di root `cloudflare/` (yang tidak ada), lalu gagal dengan pesan menyesatkan
+"No KV namespaces are configured in your wrangler config file".
+
+Ukuran nyata: `prompt.txt` 16 KB + `knowledge.txt` 57 KB = ~73 KB, aman di KV;
+gambar (70 berkas, 4,7 MB) ke R2 dengan kunci `knowledge/images/<nama>`.
+
 ### Catatan katalog (dari referensi `automation_chat`)
 
 Rencana kerja menyebut referensi `automation_chat`, dan proyek itu ada di mesin
@@ -483,7 +507,7 @@ cd cloudflare/tools/hmac-fixture && go run . ../../shared/test/fixtures/wuzapi-h
 | `pnpm run deploy -- --number <nomor>` | deploy worker nomor itu |
 | `pnpm run tail -- --number <nomor>` | stream log produksi |
 | `pnpm run smoke:ai [-- --number <nomor>]` | uji endpoint AI: teks, native tool calling, JSON mode |
-| `pnpm run knowledge -- --number <nomor>` | unggah prompt/knowledge — baru ada di FASE 3 |
+| `pnpm run knowledge -- --number <nomor>` | unggah prompt/knowledge — **belum ada skripnya**; lihat perintah manual di bagian 8 |
 | `pnpm run simulate -- --url … --key …` | kirim satu webhook bertanda tangan |
 
 Rotasi HMAC tanpa downtime: `WUZAPI_HMAC_KEYS` menerima beberapa key dipisah
