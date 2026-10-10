@@ -1,0 +1,48 @@
+# wuzapi tanpa PostgreSQL dan tanpa RabbitMQ, untuk menguji pipeline Cloudflare
+# secara end-to-end di mesin lokal.
+#
+#   cd cloudflare/wuzapi-local
+#   cp .env.example .env      # isi token/HMAC/URL worker
+#   docker compose up -d --build
+#
+# Kenapa ini berjalan tanpa PostgreSQL: wuzapi memakai SQLite otomatis ketika
+# DB_USER/DB_PASSWORD/DB_NAME/DB_HOST/DB_PORT tidak lengkap (lihat wuzapi/db.go).
+# Kenapa ini berjalan tanpa RabbitMQ: tanpa RABBITMQ_URL, publish ke queue
+# di-nonaktifkan, dan seluruh event keluar lewat webhook.
+services:
+  wuzapi:
+    build:
+      context: ../../wuzapi
+    # Argumen tambahan untuk ENTRYPOINT image; SQLite dan media disimpan di volume.
+    command: ["--datadir=/data"]
+    ports:
+      - "${WUZAPI_PORT:-8081}:8080"
+    environment:
+      WUZAPI_ADMIN_TOKEN: ${WUZAPI_ADMIN_TOKEN:?set WUZAPI_ADMIN_TOKEN in .env}
+      # 32 byte untuk AES-256; tanpa ini wuzapi membuat key acak dan data
+      # terenkripsi (termasuk HMAC key) hilang setiap restart.
+      WUZAPI_GLOBAL_ENCRYPTION_KEY: ${WUZAPI_GLOBAL_ENCRYPTION_KEY:?set a 32-byte key in .env}
+      # Harus diisi eksplisit, kalau tidak wuzapi membuat HMAC key acak dan
+      # signature tidak bisa diverifikasi worker.
+      WUZAPI_GLOBAL_HMAC_KEY: ${WUZAPI_GLOBAL_HMAC_KEY:?set the same key as the worker secret}
+      # Untuk uji cepat: webhook global. Di produksi pakai webhook per nomor dari
+      # dashboard (lihat cloudflare/README.md).
+      WUZAPI_GLOBAL_WEBHOOK: ${WUZAPI_GLOBAL_WEBHOOK:-}
+      WEBHOOK_FORMAT: ${WEBHOOK_FORMAT:-json}
+      WEBHOOK_RETRY_ENABLED: ${WEBHOOK_RETRY_ENABLED:-true}
+      WEBHOOK_RETRY_COUNT: ${WEBHOOK_RETRY_COUNT:-2}
+      WEBHOOK_RETRY_DELAY_SECONDS: ${WEBHOOK_RETRY_DELAY_SECONDS:-5}
+      WUZAPI_MEDIA_TMPDIR: /data/media
+      WUZAPI_MEDIA_CONCURRENCY: ${WUZAPI_MEDIA_CONCURRENCY:-2}
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      # Berisi SQLite (dbdata/) dan berkas media sementara (media/).
+      - wuzapi-data:/data
+    extra_hosts:
+      # Agar container bisa memanggil worker lokal di host (wrangler dev).
+      - "host.docker.internal:host-gateway"
+    restart: on-failure
+
+volumes:
+  wuzapi-data:

@@ -1,0 +1,45 @@
+# Local-only secrets for `pnpm run dev -- --number <nomor>`.
+# Copy to `.dev.vars` (git-ignored) and adjust. Production values are set with
+# `pnpm run secrets -- --number <nomor>` and never live in the repository.
+#
+#   cp .dev.vars.example .dev.vars
+#
+# `pnpm run secrets … --from-env` reads these same names from the environment,
+# which is the recommended way to push a real key without putting it on the
+# command line (and therefore into shell history).
+
+# Signs the webhook URL: /ingest/<INGEST_TOKEN>. Must match the URL pasted into
+# the wuzapi dashboard.
+INGEST_TOKEN=dev-ingest-token-change-me-0123456789
+# Must match the HMAC key typed into the wuzapi dashboard for this number.
+WUZAPI_HMAC_KEYS=dev-hmac-key-change-me-0123456789abcdef
+# Signs relayed payloads so the old bot can verify them (BOT_MODE=off only).
+DOWNSTREAM_HMAC_KEY=dev-downstream-key-change-me
+# Optional DLQ alert target.
+# ALERT_WEBHOOK_URL=https://alerts.example.com/hooks/wuzapi
+
+# ---------------------------------------------------------------------------
+# Automation (BOT_MODE=shadow|on). All optional while BOT_MODE=off.
+# ---------------------------------------------------------------------------
+
+# wuzapi REST API token for this number: used for /chat/send/* and
+# /user/contacts. Sent as the `Token` header.
+WUZAPI_TOKEN=dev-wuzapi-token-change-me
+# OpenAI-compatible endpoint key. Never commit a real key.
+AI_API_KEY=dev-ai-key-change-me
+
+# Order/payment database (phase 5). HTTP libsql, no Cloudflare binding.
+TURSO_DATABASE_URL=libsql://your-db.turso.io
+TURSO_AUTH_TOKEN=dev-turso-token-change-me
+
+# Payment gateway (phase 5).
+PAYMENT_API_KEY=dev-payment-key-change-me
+PAYMENT_CALLBACK_SECRET=dev-payment-callback-secret-change-me
+
+# Telegram admin approval card (phase 5).
+TELEGRAM_BOT_TOKEN=dev-telegram-token-change-me
+TELEGRAM_CHAT_ID=-1001234567890
+TELEGRAM_WEBHOOK_SECRET=dev-telegram-webhook-secret-change-me
+
+# Bearer key for /admin/knowledge/sync and /admin/contacts/sync.
+ADMIN_API_KEY=dev-admin-key-change-me

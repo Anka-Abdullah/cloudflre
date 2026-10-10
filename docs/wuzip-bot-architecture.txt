@@ -1,0 +1,825 @@
+wuzip-bot-architecture.txt - arsitektur wuzapi + Cloudflare Queue per nomor
+==========================================================================
+Ruang lingkup : diagram, resource per nomor, KONTRAK QUEUE yang dibekukan, bentuk
+                payload WuzAPI, skema D1, skema Turso (rencana), env & secret,
+                invariant idempotensi, dan batasan yang mengikat.
+Pasangan      : wuzip-bot-flow.txt (alur), wuzip-bot-runbook.txt (operasi).
+Path          : relatif terhadap root repo /Users/ank/project/wuzip-bot
+Aturan        : TIDAK ADA nilai secret di dokumen ini. Hanya nama variabel.
+                Sesuatu yang belum ada kodenya ditandai "RENCANA (FASE n)".
+
+
+1. DIAGRAM
+----------
+  WhatsApp customer
+        |
+        | pesan 1:1 / grup / status / media
+        v
+  +---------------------------+   POST /ingest/<INGEST_TOKEN>
+  | wuzapi (Go, per nomor)    |   header x-hmac-signature
+  | TIDAK DIUBAH oleh proyek  |--------------------------------------+
+  | ini                       |                                      |
+  +---------------------------+                                      |
+        ^                                                            v
+        | POST /chat/send/text|image|document (header "token")   +----------------+
+        | GET  /user/contacts                                    | Worker         |
+        +--------------------------------------------------------| wuzapi-<nomor> |
+                                                                 | fetch()        |
+                                                                 |  GET  /healthz |
+                                                                 |  POST /ingest/ |
+                                                                 | queue()        |
+                                                                 +---+--------+---+
+                                                                     |        ^
+                                            EVENTS.send(envelope v1)  |        | push
+                                                                     v        | consumer
+                                                   +-----------------------------+
+                                                   | Queue wuzapi-<nomor>-events |
+                                                   | max_batch_size 20           |
+                                                   | max_batch_timeout 5 s       |
+                                                   | max_retries 5, retry 30 s   |
+                                                   +--------------+--------------+
+                                                                  | retry habis
+                                                                  v
+                                                   +-----------------------------+
+                                                   | DLQ wuzapi-<nomor>-dlq      |
+                                                   | max_batch_size 10           |
+                                                   +--------------+--------------+
+                                                                  | arsip
+                                                                  v
+                                                   +-----------------------------+
+                                                   | R2 wuzipbot-media-<nomor>   |
+                                                   | _dlq/<slug>/<tgl>/<id>.json |
+                                                   +-----------------------------+
+
+  queue() memilih consumer berdasarkan BOT_MODE:
+
+    BOT_MODE=off     -> relay: POST envelope ke DOWNSTREAM_URL (+HMAC downstream)
+    BOT_MODE=shadow  -> pipeline bot penuh, deliver=false (tidak ada kirim)
+    BOT_MODE=on      -> pipeline bot penuh, deliver=true
+
+  pipeline bot (cloudflare/shared/src/bot/queue/handlers.ts):
+
+    filter -> policy -> lock -> claim -> history -> responder -> deliver -> settle
+       |         |        |        |                    |          |
+       |         |        |        |                    |          +--> WuzAPI REST
+       |         |        |        |                    |               (kirim balasan)
+       |         |        |        |                    +--> RENCANA (FASE 3):
+       |         |        |        |                         HTTP ke AI (OpenAI-compatible)
+       |         |        |        +--> D1 BOT_DB (processed_events, messages, ...)
+       |         |        +--> Durable Object ChatCoordinator
+       |         |              idFromName(chatJid)      = lock + seen-set
+       |         |              idFromName("__rate__:<slug>") = token bucket kirim
+       |         +--> D1 BOT_DB (contacts, suppressed_chats, chat_state)
+       +--> murni CPU (shared/src/bot/filter.ts)
+
+  Panggilan HTTP opsional (semua lewat fetch, tanpa binding Cloudflare):
+    AI        : AI_BASE_URL + AI_API_KEY            -> RENCANA (FASE 3)
+    Turso     : TURSO_DATABASE_URL + TURSO_AUTH_TOKEN -> RENCANA (FASE 5), HTTP libsql
+    Sumopod   : PAYMENT_API_BASE + PAYMENT_API_KEY  -> RENCANA (FASE 5)
+    Telegram  : TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID -> RENCANA (FASE 5)
+    Downstream: DOWNSTREAM_URL + DOWNSTREAM_HMAC_KEY -> ADA (BOT_MODE=off)
+    Alert DLQ : ALERT_WEBHOOK_URL                    -> ADA (opsional)
+
+  cron / scheduled() -> RENCANA (FASE 7). worker.ts hari ini hanya mengekspor
+  fetch() dan queue(); belum ada handler scheduled sehingga
+  CONTACT_SYNC_INTERVAL_MINUTES dan RECONCILE_INTERVAL_MINUTES belum berefek.
+
+
+2. RESOURCE PER NOMOR DAN KONVENSI NAMANYA
+------------------------------------------
+Satu nomor = satu set resource lengkap. Tidak ada resource yang dipakai bersama
+antar nomor selain kode di cloudflare/shared/.
+
++------------------+-------------------------------+-------------------------------+
+| Resource         | Nama (konvensi)               | Binding / pemilik             |
++------------------+-------------------------------+-------------------------------+
+| Worker           | wuzapi-<nomor>                | entry cloudflare/<nomor>/     |
+|                  |                               | src/index.ts                  |
+| Queue (events)   | wuzapi-<nomor>-events         | binding EVENTS                |
+| Queue (DLQ)      | wuzapi-<nomor>-dlq            | binding DLQ + DLQ_QUEUE_NAME  |
+| Bucket R2        | wuzipbot-media-<nomor>        | binding MEDIA (payload besar, |
+|                  |                               | arsip _dlq/)                  |
+| Database D1      | wuzipbot-bot-<nomor>          | binding BOT_DB (+             |
+|                  |                               | migrations_dir                |
+|                  |                               | ../shared/src/bot/            |
+|                  |                               | migrations)                   |
+| KV namespace     | WUZIPBOT_KNOWLEDGE_<nomor>    | binding KNOWLEDGE_KV          |
+| Durable Object   | class ChatCoordinator         | binding CHAT_COORDINATOR      |
+| Turso            | RENCANA (FASE 5): satu DB     | secret TURSO_DATABASE_URL /   |
+|                  | per nomor (atau per tenant)   | TURSO_AUTH_TOKEN              |
+| Secret           | 14 nama, lihat bagian 8       | wrangler secret put           |
++------------------+-------------------------------+-------------------------------+
+Prefiks bisa diubah saat scaffold: pnpm run new -- --worker-prefix,
+--bucket-prefix, --d1-prefix, --kv-prefix (cloudflare/scripts/new-instance.mjs).
+Durable Object tidak perlu provisioning: dideklarasikan di wrangler.jsonc dan
+dibuat pada deploy pertama.
+
+Kunci objek R2:
+  payload besar : events/<slug>/<YYYY>/<MM>/<DD>/<uuid>.json | .form
+  arsip DLQ     : _dlq/<slug>/<YYYY-MM-DD>/<messageId>.json
+Instance Durable Object:
+  idFromName(chatJid)            -> lock + seen-set + last activity satu chat
+  idFromName("__rate__:<slug>")  -> token bucket nomor-wide untuk semua kirim
+Contoh nyata: cloudflare/6281234567890/wrangler.jsonc.
+
+
+3. KONTRAK QUEUE (DIBEKUKAN)
+----------------------------
+Sumber tunggal: cloudflare/shared/src/envelope.ts (ENVELOPE_VERSION = 1).
+Queue adalah SATU-SATUNYA transport. Tidak ada RabbitMQ, tidak ada HTTP pull
+consumer, tidak ada tabel antrean di database.
+
+3.1 EnvelopeV1 - semua field dan artinya
+
+  v            : literal 1 (ENVELOPE_VERSION). isEnvelopeV1() menolak body yang
+                 bukan objek atau v != 1, atau deliveryId bukan string.
+  kind         : salah satu dari daftar 3.2.
+  receivedAt   : ISO-8601 UTC saat worker menerima webhook (bukan waktu WhatsApp).
+  deliveryId   : sha256(raw body) hex. Stabil terhadap pengulangan webhook
+                 wuzapi, jadi inilah kunci idempotensi pipeline bot.
+  contentType  : "application/json", "*+json", atau
+                 "application/x-www-form-urlencoded" - sebagaimana diterima.
+  hmac         : {verified:true, algorithm:"hmac-sha256"} bila signature
+                 diverifikasi; bila tidak: {verified:false, reason:"disabled"}
+                 (HMAC_MODE=off) atau {verified:false, reason:"absent"}.
+  event.type   : nilai "type" postmap ("Message", "Connected", "QR", ...).
+                 null bila tidak terbaca (mis. pointer tanpa fields).
+  event.userID : identitas user wuzapi (string), null bila tidak ada.
+  event.instanceName : nama instance wuzapi (dari dashboard), null bila tidak ada.
+  event.payload: objek postmap hasil parse untuk kind "event";
+                 null untuk kind "media-pointer" (payload ada di R2).
+  media        : hanya pada kind "media-pointer" (MediaPointer):
+                   r2Key         kunci objek di bucket nomor ini
+                   size          ukuran body mentah (byte)
+                   sha256        sha256(body mentah) hex = deliveryId
+                   skippedFields ukuran field yang dilewati scanner,
+                                 mis. {"base64": 21431234}
+                   fields        field top-level yang disimpan (tanpa base64);
+                                 null bila payload tidak bisa diparse
+                   fieldsOmitted true bila fields dibuang karena tidak muat
+                                 dalam budget 60.000 byte
+                   mediaUrl      URL publik bila R2_PUBLIC_BASE_URL diisi,
+                                 selain itu null
+  source.worker: sama dengan slug (kompatibilitas nama lama)
+  source.slug  : INSTANCE_SLUG nomor ini
+  source.ua    : User-Agent wuzapi (mis. go-resty/...)
+  source.ip    : cf-connecting-ip
+  source.rawSize : ukuran body mentah, null bila tidak diketahui
+
+  DlqRecord (dipakai queue DLQ, bukan envelope):
+    v, failedAt (ISO), stage ("ingest" | "relay" | "dlq-consumer"),
+    reason, queue, messageId, attempts, envelope (payload asli apa adanya).
+
+3.2 Daftar kind yang sah
+
++----------------+--------------------------------------------------------------+
+| kind           | arti                                                         |
++----------------+--------------------------------------------------------------+
+| event          | satu webhook wuzapi inline (payload ikut di envelope)        |
+| media-pointer  | webhook wuzapi besar; payload ada di R2, envelope hanya      |
+|                | metadata + pointer                                           |
+| wuzapi.event   | alias eksplisit untuk dua di atas, supaya produsen eksternal |
+|                | bisa menyebut sumbernya                                      |
+| payment.event  | callback gateway pembayaran / aksi admin Telegram -          |
+|                | RENCANA (FASE 5); hari ini hanya di-ack                      |
+| outbox.tick    | "flush outbox sekarang" - RENCANA (FASE 5); hari ini hanya   |
+|                | di-ack                                                       |
++----------------+--------------------------------------------------------------+
+isWuzapiEventKind(kind) mengembalikan true untuk "event", "media-pointer", dan
+"wuzapi.event"; ketiganya masuk ke handleWuzapiEvent().
+
+3.3 Mengapa "event" dan "media-pointer" dipertahankan sebagai nama kanonik
+
+  - Keduanya yang benar-benar dipancarkan POST /ingest
+    (shared/src/ingest/handler.ts), sehingga setiap envelope yang sudah ada di
+    queue produksi, di arsip DLQ, dan di bucket R2 memakai nama itu.
+  - Seluruh uji dan fixture (shared/test/**, tools/hmac-fixture) serta
+    dokumentasi operasional memakai nama itu; mengganti nama berarti memecah
+    kompatibilitas tanpa menambah kemampuan apa pun.
+  - "wuzapi.event" tetap diterima sebagai alias, bukan pengganti, sehingga
+    produsen eksternal tetap punya satu nama yang menyebut sumber secara
+    eksplisit tanpa memaksa migrasi data lama.
+  - Menambah kind baru (payment.event, outbox.tick) aman karena router
+    meng-ack + mengarsipkan kind yang tidak dikenal, bukan melempar.
+
+
+4. BENTUK PAYLOAD WUZAPI (DIBEKUKAN)
+------------------------------------
+Sumber kebenaran adalah kode Go di wuzapi/, bukan dokumentasi.
+
+4.1 postmap
+
+  wuzapi/wmiau.go myEventHandler() membangun satu map per event:
+      postmap["event"] = rawEvt             (event whatsmeow mentah)
+      postmap["type"]  = "Message" | "Connected" | "QR" | ...
+  sendToUserWebHookWithHmac() mengirimkannya sebagai:
+      { "jsonData": "<postmap JSON>", "userID": "<id>", "instanceName": "<nama>" }
+  Jadi bentuk yang diterima worker selalu:
+      { type, event: { Info, Message, IsEphemeral, IsViewOnce, ... },
+        userID, instanceName, ... }
+  Untuk event media, postmap juga membawa field tambahan di level atas
+  (mis. base64, fileName, mimeType) - lihat mycli.processMedia().
+
+4.2 Field Info yang dibaca bot
+
+  cloudflare/shared/src/bot/filter.ts messageEventOf() membaca:
+      Chat, Sender, IsFromMe, IsGroup, ID, Timestamp, Type, PushName, Category
+  dan dari level event: IsEphemeral, IsViewOnce.
+  Yang menentukan keputusan:
+      Chat       tujuan/asal chat; menentukan server (@s.whatsapp.net, @lid,
+                 @g.us, @newsletter, @broadcast)
+      IsFromMe   true -> event diabaikan (echo balasan bot)
+      IsGroup    true -> grup, diabaikan
+      ID         wa_message_id untuk history
+      Timestamp  RFC3339; tidak bisa diparse -> waktu sekarang
+      PushName   dipakai untuk sapaan dan untuk deteksi "no_ai" langsung
+  Info.Sender dipakai sebagai senderJid, fallback ke Chat.
+
+4.3 Dua mode transport wuzapi
+
++---------------------+----------------------------------+-----------------------------+
+| WEBHOOK_FORMAT      | Body                             | Content-Type                |
++---------------------+----------------------------------+-----------------------------+
+| form (default)      | jsonData=<postmap string JSON>   | application/x-www-form-     |
+|                     | &userID=..&instanceName=..       | urlencoded                  |
+| json                | postmap apa adanya, dengan       | application/json            |
+|                     | instanceName + userID disisipkan |                             |
++---------------------+----------------------------------+-----------------------------+
+HMAC-SHA256 (header x-hmac-signature) selalu dihitung atas byte body yang
+dikirim: url.Values.Encode() untuk form, json.Marshal(postmap) untuk json
+(wuzapi/helpers.go callHookWithHmac). Worker memverifikasi byte mentah, bukan
+hasil parse ulang.
+Pada mode form, jsonData adalah satu nilai ter-escape sehingga tidak bisa
+dipindai tanpa buffering: untuk payload besar, pointer hanya membawa
+instanceName/userID dari byte awal body.
+
+4.4 Worker selalu melihat payload.event.Info
+
+  parseWebhookBody() (shared/src/ingest/parse.ts) sudah membuka transport:
+  mode json maupun form menghasilkan payload = objek postmap. Sejak titik itu
+  tidak ada lagi perbedaan bentuk: filter, policy, dan agent selalu membaca
+  payload.event.Info (dan payload.event.Message). Webhook global wuzapi
+  (WUZAPI_GLOBAL_WEBHOOK), yang mengirim jsonData sebagai string di dalam body
+  JSON, juga diterima dan dinormalisasi ke bentuk yang sama - tetapi wiring yang
+  direkomendasikan tetap webhook per nomor dari dashboard.
+
+
+5. SKEMA D1 (SUDAH ADA - cloudflare/shared/src/bot/migrations/0001_init.sql)
+---------------------------------------------------------------------------
+BOT_DB menyimpan state bot: idempotensi, history, saklar, knowledge, katalog.
+Order/payment TIDAK di sini (lihat bagian 6). Aturan yang membentuk skema:
+  - timestamp = integer epoch milidetik UTC (kolom TEXT *_at hanya bila dibaca
+    manusia);
+  - uang selalu integer rupiah, tidak pernah float;
+  - idempotensi ditegakkan UNIQUE constraint, bukan logika aplikasi;
+  - D1 tidak punya transaksi interaktif di runtime Workers, jadi tiap statement
+    harus aman berdiri sendiri (INSERT OR IGNORE / UPDATE ... WHERE).
+
+  messages
+    id TEXT PK | delivery_id TEXT UNIQUE | chat_jid TEXT NOT NULL |
+    wa_message_id TEXT | direction TEXT CHECK(in 'in','out') |
+    kind TEXT CHECK(in 'text','caption','button','list','audio') |
+    body TEXT NOT NULL DEFAULT '' | raw_json TEXT | created_at INTEGER NOT NULL
+    index: idx_messages_chat_created(chat_jid, created_at DESC),
+           idx_messages_created(created_at)
+    delivery_id UNIQUE = satu baris history per pengiriman queue.
+
+  chat_state
+    chat_jid TEXT PK | bot_enabled INTEGER NOT NULL DEFAULT 1 |
+    lock_until INTEGER NOT NULL DEFAULT 0 | last_inbound_at INTEGER |
+    last_outbound_at INTEGER | updated_at INTEGER NOT NULL DEFAULT 0
+    lock_until selalu ditulis 0 oleh kode saat ini (history.ts, policy.ts); lock
+    yang sebenarnya hidup di Durable Object ChatCoordinator (bagian 9.2).
+
+  processed_events
+    delivery_id TEXT PK | chat_jid TEXT | wa_message_id TEXT |
+    status TEXT CHECK(in 'processing','done','failed') | error TEXT |
+    processed_at INTEGER NOT NULL
+    index: idx_processed_events_chat(chat_jid, processed_at DESC)
+
+  contacts
+    chat_jid TEXT PK | full_name | first_name | push_name | business_name |
+    has_no_ai INTEGER NOT NULL DEFAULT 0 | updated_at INTEGER NOT NULL DEFAULT 0
+    index: idx_contacts_no_ai(has_no_ai)
+
+  suppressed_chats
+    chat_jid TEXT PK | reason TEXT | permanent INTEGER NOT NULL DEFAULT 0 |
+    created_at INTEGER NOT NULL
+
+  carts
+    chat_jid TEXT PK | status TEXT DEFAULT 'active'
+    CHECK(in 'active','converted','expired') | total INTEGER DEFAULT 0
+    CHECK(total >= 0) | updated_at INTEGER NOT NULL DEFAULT 0
+
+  cart_items
+    chat_jid TEXT | kode TEXT | qty INTEGER CHECK(qty > 0) |
+    unit_price INTEGER CHECK(unit_price >= 0) | updated_at INTEGER DEFAULT 0
+    PK (chat_jid, kode)
+
+  outbox
+    id INTEGER PK AUTOINCREMENT | kind TEXT CHECK(in 'text','image','document') |
+    order_ref TEXT | chat_jid TEXT NOT NULL | payload TEXT NOT NULL |
+    status TEXT DEFAULT 'pending' CHECK(in 'pending','claimed','sent','failed') |
+    attempts INTEGER DEFAULT 0 | next_attempt_at INTEGER DEFAULT 0 |
+    claimed_until INTEGER DEFAULT 0 | created_at INTEGER NOT NULL | sent_at INTEGER
+    index: idx_outbox_ready(status, next_attempt_at),
+           idx_outbox_chat(chat_jid, created_at DESC)
+    Satu-satunya tempat kirim WuzAPI dicatat; belum ada kode yang menulisnya
+    (RENCANA FASE 5).
+
+  knowledge_chunks
+    id INTEGER PK AUTOINCREMENT | source TEXT NOT NULL | ordinal INTEGER NOT NULL |
+    content TEXT NOT NULL | hash TEXT NOT NULL | updated_at INTEGER DEFAULT 0
+    UNIQUE: idx_knowledge_chunks_source_ordinal(source, ordinal)
+    Proyeksi teks knowledge yang bisa dicari (FASE 3).
+
+  catalog_products
+    kode TEXT PK | nama TEXT NOT NULL | harga INTEGER NOT NULL |
+    ongkir_known INTEGER DEFAULT 0 | ongkir_included INTEGER DEFAULT 0 |
+    updated_at INTEGER DEFAULT 0
+    AI hanya boleh mengutip harga yang ada di tabel ini (FASE 3).
+
+Dibuktikan uji: cloudflare/shared/test/d1.test.ts membuat semua tabel di atas dari
+file migration yang sama dengan produksi, membuktikan FTS5/bm25/unicode61, dan
+membuktikan UNIQUE messages.delivery_id serta PK processed_events menolak
+salinan kedua.
+
+
+6. SKEMA TURSO - DIBEKUKAN, BELUM DIMIGRASIKAN (FASE 5)
+-------------------------------------------------------------------
+Status: SKEMA DIBAWAH INI SUDAH DIBEKUKAN (rencana kerja bagian 7, jawaban
+Q15). Yang belum ada hanyalah kodenya: belum ada DDL Turso di repo, dan
+payment/turso.ts baru dibuat di FASE 5.
+
+Akses: HTTP libsql langsung dari worker lewat @libsql/client/web (fetch), TANPA
+binding Cloudflare. URL dan token per nomor lewat secret TURSO_DATABASE_URL dan
+TURSO_AUTH_TOKEN.
+
+Aturan uang: SEMUA nilai uang disimpan sebagai INTEGER rupiah, tidak pernah
+float. Bila harus kompatibel dengan dashboard lama yang memakai satuan sen,
+konversi rupiah <-> sen dilakukan di adapter Turso, bukan di skema.
+
+Aturan status: setiap operasi status memakai unique key + UPDATE kondisional
+(contoh: UPDATE orders SET status='paid' WHERE kode_pesanan=? AND status IN
+('pending','approved')), sehingga callback yang datang dua kali tidak menghasilkan
+transisi kedua. Callback ganda adalah kasus normal, bukan pengecualian.
+
+  customers
+    id          INTEGER PRIMARY KEY AUTOINCREMENT
+    nama        TEXT NOT NULL
+    no_hp       TEXT UNIQUE
+    email       TEXT
+    alamat      TEXT
+    catatan     TEXT
+    created_at  TEXT
+    updated_at  TEXT
+
+  orders
+    id              INTEGER PRIMARY KEY AUTOINCREMENT
+    ref             TEXT UNIQUE
+    client_ref      TEXT UNIQUE      -- kunci idempotensi checkout dari worker
+    kode_pesanan    TEXT UNIQUE      -- nomor yang dibaca customer
+    wa_chat_jid     TEXT
+    customer_id     INTEGER
+    alamat_kirim    TEXT
+    total_harga     INTEGER          -- rupiah
+    additional_fee  INTEGER DEFAULT 0
+    grand_total     INTEGER          -- rupiah
+    ongkir_included INTEGER DEFAULT 0
+    status          TEXT             -- 9 nilai, lihat tabel di bawah
+    payment_url     TEXT
+    expires_at      INTEGER          -- epoch ms
+    paid_at         INTEGER          -- epoch ms
+    created_at      TEXT
+    updated_at      TEXT
+
+  order_items
+    id          INTEGER PRIMARY KEY AUTOINCREMENT
+    order_id    INTEGER
+    kode        TEXT
+    nama_produk TEXT
+    harga       INTEGER              -- rupiah, disalin dari catalog_products (D1)
+    qty         INTEGER
+    subtotal    INTEGER              -- rupiah
+
+  payments
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT
+    order_id            INTEGER
+    kode_bayar          TEXT UNIQUE
+    provider            TEXT             -- 'sumopod' (PAYMENT_PROVIDER)
+    provider_ref        TEXT
+    metode              TEXT             -- mis. 'qris'
+    url                 TEXT
+    jumlah              INTEGER          -- rupiah
+    status              TEXT
+    telegram_message_id INTEGER          -- pesan kartu approval yang di-edit
+    approval_status     TEXT             -- 'approved' | 'rejected'
+    approval_reason     TEXT             -- alasan Tolak / nilai Ubah Biaya
+    raw_json            TEXT             -- payload gateway apa adanya
+    expires_at          INTEGER
+    paid_at             INTEGER
+    created_at          TEXT
+    updated_at          TEXT
+
+Status order (dibekukan, kolom orders.status):
+
+  creating           -> order sedang disusun, belum ada baris pasti
+  awaiting_approval  -> ongkir_included=0; kartu Telegram menunggu admin
+  approved           -> admin menerima; link pembayaran boleh dibuat/dikirim
+  rejected           -> admin menolak; alasan dikirim sekali ke customer
+  pending            -> link sudah dikirim, menunggu pembayaran
+  paid               -> gateway mengonfirmasi lunas; nota PDF dikirim sekali
+  expired            -> melewati expires_at tanpa pembayaran
+  failed             -> gateway/perintah gagal permanen
+  superseded         -> digantikan order yang lebih baru untuk chat yang sama
+
+Yang sudah ada di repo dan menjadi jembatan ke skema ini:
+  - outbox.order_ref (D1) menghubungkan baris outbox ke orders.ref / kode_pesanan;
+  - kind envelope payment.event dan outbox.tick sudah dibekukan (envelope.ts);
+  - config PAYMENT_* dan TELEGRAM_* sudah dibaca loadConfig() tetapi belum dipakai;
+  - order_items.harga harus selalu divalidasi ulang terhadap catalog_products (D1)
+    sebelum order disetujui - harga tidak pernah datang dari teks customer maupun
+    dari model AI.
+
+Catatan sumber: dokumen rencana kerja (bagian 7) tidak ada di dalam repo, jadi
+skema di atas disalin dari brief FASE 0/FASE 5 yang diberikan pemilik proyek,
+bukan dikarang. Kalau DDL final nanti berbeda, perbarui bagian ini lebih dulu.
+
+
+6b. UJI AI - STATUS PER AKHIR SESI 1
+-------------------------------------------------------------------
+Dibuktikan TANPA key (probe langsung dari mesin pengembang):
+
+  GET  https://sejahteraselamanya.my.id/v1/models
+  POST https://sejahteraselamanya.my.id/v1/chat/completions
+    -> HTTP 401 application/json dalam ~0,2-0,3 detik
+    -> body: {"error":"API key required for remote API access"}
+
+Yang TERBUKTI dari probe itu:
+  - host dapat dijangkau, TLS valid, latensi rendah (bukan domain mati);
+  - AI_BASE_URL yang benar memang "https://sejahteraselamanya.my.id/v1",
+    karena endpoint berada di /v1/models dan /v1/chat/completions;
+  - endpoint menolak permintaan tanpa kredensial dengan 401 yang rapi.
+
+Yang BELUM terbukti (butuh AI_API_KEY, lihat checklist di runbook bagian 4):
+  - apakah Authorization: Bearer <key> adalah skema yang diterima;
+  - balasan teks, native tool calling, dan response_format json_object.
+
+Konsekuensi untuk FASE 3: klien AI harus menangani DUA bentuk error - bentuk
+OpenAI standar {"error":{"message":...}} dan bentuk ringkas yang dipakai
+endpoint ini {"error":"..."} (string, bukan objek). Jangan mengasumsikan
+error selalu objek. Bila native tool calling ternyata tidak tersedia, aktifkan
+fallback JSON mode + parser internal (risiko R1).
+
+Catatan: probe ini hanya membaca; tidak ada key yang dipakai atau ditulis.
+
+Skrip smoke-nya sendiri SUDAH diverifikasi terhadap tiga server tiruan
+(OpenAI-compatible) sebelum key asli ada, supaya saat key tiba yang diuji
+benar-benar modelnya, bukan skripnya:
+
+  capable  -> teks + tool_calls + json_object   : [PASS] x3, exit 0
+  notools  -> menjawab teks untuk permintaan tool: [WARN], saran JSON mode, exit 0
+  denied   -> 401 {"error":"..."}                : [FAIL] teks, exit 1
+
+Kontrak exit code (dipakai otomasi): 0 = dialog bekerja (dengan atau tanpa
+native tool calling), 1 = dialog gagal, 2 = tidak ada API key.
+
+
+6c. FREEZE DARI REFERENSI automation_chat (SUMBER OTORITATIF)
+-------------------------------------------------------------------
+Rencana kerja menyebut "Referensi: flow bisnis automation_chat". Proyek itu ADA
+di mesin ini (/Users/ank/project/automation_chat) dan dokumen alurnya
+(docs/alur-pesanan-queue.txt, 294 baris) plus knowledge aslinya sudah dibaca.
+Bagian ini mencatat yang dibekukan dari sana - bukan karangan. TIDAK ADA nilai
+secret yang dibaca, disalin, atau ditulis; file .env proyek itu tidak dibuka.
+
+a) ATURAN ongkir_included (persis dari referensi)
+   ongkir_included = true HANYA JIKA keranjang tidak kosong, SEMUA item ada di
+   katalog, DAN semua item punya baris "Ongkir: termasuk".
+   Selain itu -> JALUR ADMIN (Cabang B). Itu default yang aman, bukan error.
+
+b) KATALOG NYATA TIDAK PUNYA BARIS "Ongkir:" (temuan, perlu tindakan Anda)
+   knowledge/docs/knowledge.txt (56.965 byte, 70 produk) mengandung 0 kemunculan
+   "Ongkir" dan 0 "Harga coret". Karena aturan (a), SELURUH katalog saat ini akan
+   selalu jatuh ke jalur admin: tidak akan pernah ada link otomatis tanpa review
+   admin. Kalau Cabang A diinginkan, baris "Ongkir: termasuk" harus ditambahkan
+   per produk lebih dulu.
+
+c) FORMAT knowledge.txt YANG SEBENARNYA (koreksi atas rencana Q9)
+   Rencana menyebut "blok Produk/Harga/Ongkir". Kenyataannya TIDAK ADA label
+   "Produk:" dan tidak ada "Ongkir:". Bentuk nyatanya:
+
+     #03  CASTELLI ENTRATA SHORT BLACK 010 SIZE XL (G 4520009)
+     ------------------------------------------------------------------
+       Brand          : CASTELLI
+       SKU/Code       : G 4520009
+       Template ID    : 116964
+       Variant ID     : 124120
+       Harga          : Rp 1.400.000,00
+       Mata Uang      : IDR
+       Kategori       : Men (men-239)
+       Image URL      : https://...
+       Image Filename : ...
+       Product URL    : https://...
+
+   Konsekuensi untuk knowledge/catalog.ts (FASE 3):
+     - nama produk = teks setelah "#NN  " pada baris header;
+     - harga = angka pada baris "Harga", format "Rp 1.400.000,00" -> 1400000;
+     - Parsing "Rp 1.400.000,00" harus membuang titik ribuan DAN ",00" desimal;
+     - SKU/Code SERING tidak ada (isinya "(tidak ada kode eksplisit di nama
+       produk)"), jadi catalog_products.kode TIDAK BOLEH bergantung pada SKU.
+       Pakai "Template ID" sebagai kode stabil (mis. kode = "T116964"), dan
+       simpan SKU sebagai nama alternatif bila ada;
+     - baris "Ongkir:" absen => ongkir_included = 0 (lihat butir b).
+
+d) prompt.txt: [GAMBAR: <name> - <Caption>] dan nama tool
+   prompt.txt (16.046 byte) memakai penanda [GAMBAR: <name> - <Caption>] dan
+   menyebut tool send_image, add_to_cart, view_cart, remove_from_cart,
+   create_payment_link - sama persis dengan daftar tool di rencana. Jadi
+   agent/tools.ts (FASE 3) memakai nama itu tanpa perubahan.
+
+e) KNOWLEDGE_MODE=auto DENGAN DATA NYATA -> kv_inline
+   prompt.txt + knowledge.txt = 56.965 + 16.046 = 73.011 byte, jauh di bawah
+   KNOWLEDGE_INLINE_MAX_BYTES (1.048.576). Jadi auto akan memilih kv_inline
+   (satu KV GET + pencarian di memori), BUKAN r2_d1_fts. Jalur FTS5 tetap
+   disiapkan untuk saat knowledge tumbuh melewati ambang itu.
+   Gambar (70 file, 4,7 MB) selalu ke R2, bukan KV, dan dikirim lewat
+   [GAMBAR:] -> send_image.
+
+f) STATUS YANG PERNAH LEWAT QUEUE HANYA 5, BUKAN 9
+   Dari referensi, event Worker -> bot sales hanya: approved, rejected,
+   expired, failed, paid. Empat status lain (creating, awaiting_approval,
+   pending, superseded) adalah status internal di Turso/D1 dan TIDAK PERNAH
+   dikirim sebagai event queue. Ini memperjelas tabel status di bagian 6.
+
+g) KUNCI IDEMPOTENSI payment.event
+   Referensi memakai id = "<order_ref>:<status>:<provider_ref|paid_at|''>"
+   supaya kiriman ulang tidak berbahaya. Untuk envelope kita yang memakai
+   deliveryId, nilai itu dipakai APA ADANYA sebagai deliveryId (bukan sha256
+   body), sehingga event yang sama selalu punya kunci yang sama walau payload
+   JSON-nya berbeda urutan field. Dibekukan untuk FASE 5.
+
+h) ARAH KOMUNIKASI (jangan dibalik)
+   - bot -> Worker (buat order): HTTP bertanda tangan, BUKAN queue, karena tool
+     butuh jawaban langsung untuk menjawab customer saat itu juga.
+   - Worker -> bot (approved/rejected/paid/...): QUEUE, karena arah ini tidak
+     boleh hilang dan tidak butuh jawaban langsung.
+   - Kartu Telegram: dikirim langsung (bukan queue) karena Worker butuh
+     message_id untuk mengedit kartu saat admin menekan tombol.
+   Arsitektur baru tetap memakai pembagian ini; yang berubah hanya bot-nya
+   (WuzAPI + Worker, bukan GOWA).
+
+i) PENANDA IDEMPOTENSI KIRIM
+   Referensi memakai link_sent_at (link) dan confirmation_sent_at (nota),
+   keduanya "diklaim dengan lease". Itu sama dengan mekanisme outbox
+   (claimed_until) yang sudah ada di migrations/0001_init.sql, jadi FASE 5/6
+   memakai outbox yang sama - bukan penanda baru.
+
+j) NOTA PDF (FASE 6)
+   Isi (dari referensi): header opsional; judul "NOTA PEMBAYARAN"; nomor nota
+   (kode PAY) + kode pesanan (INV); tanggal pembayaran WIB; nama/WA/alamat;
+   tabel Produk | Qty | Harga | Subtotal; Subtotal, Biaya tambahan (bila ada),
+   keterangan "Ongkir: sudah termasuk" (bila Cabang A), Total; Metode QRIS,
+   Dibayar <WIB>, Status Lunas; footer. Nama berkas: Nota-<order_ref>.pdf.
+   Kalau render gagal -> nota teks biasa (customer tidak pernah dibiarkan
+   tanpa konfirmasi).
+
+k) ALIGNMENT RETRY/DLQ
+   Referensi: 400/401/403/404/409/422 -> permanen; 429/5xx/tanpa jawaban ->
+   backoff; habis max_retries -> DLQ; DLQ -> kabari admin. Router bot kita
+   memakai klasifikasi yang sama (PERMANENT_STATUS + backoff eksponensial),
+   jadi tidak ada perubahan yang diperlukan. Notifikasi DLQ ke Telegram adalah
+   item FASE 7 (saat ini ALERT_WEBHOOK_URL sudah jalan).
+
+Catatan: referensi memakai GOWA (Go) + fpdf. Rencana kerja melarang GOWA dan
+memakai pdf-lib, jadi yang diadopsi dari referensi adalah ATURAN BISNIS dan
+FORMAT, bukan kodenya.
+
+
+7. KEPUTUSAN FASE 0 YANG SUDAH DIBUKTIKAN (FTS5)
+-----------------------------------------------
+Terbukti di runtime D1 (cloudflare/shared/test/d1.test.ts):
+  CREATE VIRTUAL TABLE ... USING fts5(content,
+      tokenize='unicode61 remove_diacritics 2')
+  SELECT content, bm25(probe_fts) AS score FROM probe_fts
+   WHERE probe_fts MATCH 'hoodie' ORDER BY score
+berhasil dan mengembalikan baris yang tepat. Jadi D1 mendukung FTS5 + bm25 +
+tokenizer unicode61.
+
+Konsekuensi yang dibekukan: KNOWLEDGE_MODE=auto boleh memilih
+  - kv_inline   bila knowledge.txt muat dalam KNOWLEDGE_INLINE_MAX_BYTES
+                (default 1.048.576 byte) - murah, satu KV GET; atau
+  - r2_d1_fts   bila knowledge lebih besar - knowledge.txt di R2, chunk dicari
+                dengan FTS5 + bm25 di D1.
+
+Tabel virtual FTS5 DIBUAT LAZY SAAT SYNC KNOWLEDGE (FASE 3), bukan di
+0001_init.sql. Alasannya: bila CREATE VIRTUAL TABLE fts5 ditulis di migration dan
+suatu saat runtime/akun tidak mendukung FTS5 (risiko R3), `pnpm run migrate` akan
+GAGAL TOTAL - termasuk tabel-tabel yang tidak ada hubungannya dengan pencarian -
+sehingga nomor itu tidak bisa dipakai sama sekali. Dengan pembuatan lazy, migrate
+tetap bersih, sync knowledge yang gagal hanya menurunkan mode pencarian ke
+kv_inline, dan knowledge kecil tetap bisa dilayani. Karena itu 0001_init.sql
+hanya berisi tabel biasa knowledge_chunks.
+
+
+8. ENV & SECRET (NAMA SAJA - TIDAK ADA NILAI DI DOKUMEN INI)
+------------------------------------------------------------
+Aturan: tidak ada API key di repo. Contoh nyata ada di cloudflare/<nomor>/
+.dev.vars.example (nilai dev palsu) dan .dev.vars yang di-gitignore. Nilai
+produksi hanya masuk lewat `wrangler secret put`.
+
+8.1 Vars (cloudflare/<nomor>/wrangler.jsonc, bagian "vars")
+
++-------------------------------+---------------------------+---------------------------+
+| Nama                          | Default (config.ts)       | Fungsi                    |
++-------------------------------+---------------------------+---------------------------+
+| INSTANCE_SLUG                 | wajib, E.164 tanpa "+"    | identitas nomor           |
+| INLINE_MAX_BYTES              | 90000                     | ambang inline vs R2       |
+| MEDIA_BUFFER_MAX_BYTES        | 25000000                  | cap body tanpa CL         |
+| SCAN_MAX_FIELD_BYTES          | 262144                    | cap field saat scan JSON  |
+| HMAC_MODE                     | strict                    | strict/optional/off       |
+| MEDIA_MODE                    | r2                        | r2/reject                 |
+| RELAY_MODE                    | relay                     | relay/observe             |
+| RETRY_BASE_SECONDS            | 15                        | basis backoff consumer    |
+| RETRY_MAX_SECONDS             | 3600                      | cap backoff consumer      |
+| DOWNSTREAM_URL                | (kosong)                  | tujuan relay BOT_MODE=off |
+| R2_PUBLIC_BASE_URL            | (kosong)                  | mengisi media.mediaUrl    |
+| DLQ_QUEUE_NAME                | (kosong -> sufiks -dlq)   | deteksi queue DLQ         |
+| BOT_MODE                      | off                       | off/shadow/on + rollback  |
+| WUZAPI_API_BASE               | (kosong)                  | base URL REST wuzapi      |
+| AI_BASE_URL                   | (kosong)                  | endpoint OpenAI-compatible|
+| AI_MODEL                      | (kosong)                  | id model                  |
+| AI_TIMEOUT_MS                 | 60000                     | timeout AI + klien wuzapi |
+| AI_MAX_TURNS                  | 3                         | batas putaran tool        |
+| KNOWLEDGE_MODE                | auto                      | auto/kv_inline/r2_d1_fts  |
+| KNOWLEDGE_INLINE_MAX_BYTES    | 1048576                   | batas knowledge di KV     |
+| KNOWLEDGE_TOP_K               | 5                         | jumlah chunk di prompt    |
+| KNOWLEDGE_HISTORY_LIMIT       | 10                        | jumlah pesan history      |
+| CONTACT_SYNC_INTERVAL_MINUTES | 10 (0 = mati)             | sync contacts (FASE 4)    |
+| PAYMENT_PROVIDER              | sumopod                   | nama provider             |
+| PAYMENT_API_BASE              | (kosong)                  | base URL gateway          |
+| PAYMENT_EXPIRES_HOURS         | 24                        | masa berlaku order        |
+| PAYMENT_DRY_RUN               | true                      | bangun link tanpa panggil |
+| TELEGRAM_ENABLED              | false                     | saklar kartu admin        |
+| PUBLIC_BASE_URL               | (kosong)                  | URL callback publik       |
+| BOT_MAX_ITEMS                 | 20                        | maks item per cart        |
+| BOT_MAX_ITEM_QTY              | 99                        | maks qty per item         |
+| OUTBOX_BATCH                  | 20                        | ukuran batch flush outbox |
+| RECONCILE_INTERVAL_MINUTES    | 1                         | rekonsiliasi (FASE 7)     |
+| VOICE_ENABLED                 | false                     | saklar voice (FASE 9)     |
++-------------------------------+---------------------------+---------------------------+
+Semua nilai di atas divalidasi saat load: integer dengan rentang, enum dengan
+daftar nilai. Nilai tidak sah -> ConfigError -> /healthz 500 / log config_invalid
+(permintaan tetap dilayani dengan jawaban jelas, bukan error buram).
+
+8.2 Secret (wrangler secret put; 14 nama, daftar ENV_SECRETS di scripts/instance.mjs)
+
++-----------------------------+----------------------------------+-----------------------+
+| Nama                        | Fungsi                           | Wajib untuk           |
++-----------------------------+----------------------------------+-----------------------+
+| INGEST_TOKEN                | token di path /ingest/<token>    | selalu                |
+| WUZAPI_HMAC_KEYS            | key HMAC wuzapi (boleh >1,       | selalu (HMAC_MODE !=  |
+|                             | dipisah koma, untuk rotasi)      | off)                  |
+| DOWNSTREAM_HMAC_KEY         | tanda tangan relay ke bot lama   | BOT_MODE=off          |
+| ALERT_WEBHOOK_URL           | tujuan alert DLQ (opsional)      | opsional              |
+| WUZAPI_TOKEN                | header "token" ke REST wuzapi    | BOT_MODE != off       |
+| AI_API_KEY                  | bearer ke endpoint AI            | RENCANA (FASE 3)      |
+| TURSO_DATABASE_URL          | URL libsql                       | RENCANA (FASE 5)      |
+| TURSO_AUTH_TOKEN            | token libsql                     | RENCANA (FASE 5)      |
+| PAYMENT_API_KEY             | kunci gateway Sumopod            | RENCANA (FASE 5)      |
+| PAYMENT_CALLBACK_SECRET     | verifikasi callback gateway      | RENCANA (FASE 5)      |
+| TELEGRAM_BOT_TOKEN          | bot token Telegram               | RENCANA (FASE 5)      |
+| TELEGRAM_CHAT_ID            | chat penerima kartu admin        | RENCANA (FASE 5)      |
+| TELEGRAM_WEBHOOK_SECRET     | nilai X-Telegram-Bot-Api-Secret- | RENCANA (FASE 5)      |
+|                             | Token                            |                       |
+| ADMIN_API_KEY               | bearer untuk /admin/*            | RENCANA (FASE 5/6)    |
++-----------------------------+----------------------------------+-----------------------+
+Catatan: AI_API_KEY sudah ikut dihitung botReadiness(), jadi /healthz melaporkan
+bot.ready=false dan menyebut "AI_API_KEY" selama secret itu belum diset - walau
+FASE 3 belum ada. Itu disengaja: nomor yang belum siap AI jangan dinyalakan
+BOT_MODE=on tanpa sadar.
+
+8.3 Binding
+
++-------------------+---------------------+-----------------------------------------+
+| Binding           | Resource            | Wajib?                                  |
++-------------------+---------------------+-----------------------------------------+
+| EVENTS            | Queue events        | ya                                      |
+| DLQ               | Queue DLQ           | ya                                      |
+| MEDIA             | Bucket R2           | ya                                      |
+| BOT_DB            | D1                  | ya untuk BOT_MODE != off                |
+| KNOWLEDGE_KV      | KV                  | RENCANA (FASE 3)                        |
+| CHAT_COORDINATOR  | Durable Object      | ya untuk BOT_MODE != off (degradasi     |
+|                   |                     | tanpa lock bila tidak ada)              |
++-------------------+---------------------+-----------------------------------------+
+BOT_DB, KNOWLEDGE_KV, dan CHAT_COORDINATOR sengaja opsional di tipe Env supaya
+nomor yang belum menjalankan bagian D1/KV/DO dari provision tetap bisa melayani
+BOT_MODE=off sebagai relay murni (cloudflare/shared/src/config.ts).
+
+
+9. INVARIANT & IDEMPOTENSI (AT-LEAST-ONCE)
+------------------------------------------
+Cloudflare Queues adalah at-least-once: satu pesan bisa dieksekusi lebih dari
+sekali. Tiga mekanisme berikut membuat itu aman.
+
+  9.1 processed_events (otoritas durabel)
+      Kode: cloudflare/shared/src/bot/idempotency.ts (claimDelivery,
+      finishDelivery, isDeliveryDone, forgetDeliveries).
+      PK delivery_id. claimDelivery():
+        INSERT OR IGNORE ... status 'processing'  -> delivery baru
+        UPDATE ... SET status='processing' WHERE delivery_id=? AND status<>'done'
+                                                  -> klaim ulang setelah gagal
+      Arti status:
+        'processing' - sedang/akan dikerjakan; BOLEH diklaim ulang (crash,
+                       worker mati, wuzapi outage). Bukan alasan untuk menolak.
+        'failed'     - percobaan terakhir gagal; BOLEH diklaim ulang, karena
+                       kegagalan bisa sementara (jaringan/gateway).
+        'done'       - balasan sudah terkirim; SATU-SATUNYA status yang menolak
+                       pengiriman ulang. Redelivery -> ack "duplicate" tanpa
+                       memanggil AI.
+      Konsekuensi: retry benar (pekerjaan yang belum selesai bisa dilanjutkan) dan
+      duplikasi tetap tertutup (pekerjaan yang sudah selesai tidak diulang).
+
+  9.2 Durable Object ChatCoordinator (serialisasi + memori cepat)
+      Satu instance per chat (idFromName(chatJid)). state.blockConcurrencyWhile
+      memuat state sebelum permintaan pertama dilayani, dan semua handler
+      dijalankan lewat rantai serialize() sehingga tidak ada dua permintaan yang
+      berjalan bersamaan - jadi cold start setelah eviction tidak bisa membagikan
+      dua lock.
+        /claim   -> lockUntil, duplicate, retryAfterMs
+        /release -> lockUntil=0, seen[deliveryId]=now+TTL bila rememberDelivery
+        /rate    -> token bucket (kapasitas, refill, cost)
+        /status  -> snapshot state
+      Lock TTL default 120 detik; seen TTL default 6 jam; maksimum 500 delivery
+      id per chat (yang paling tua dibuang). Lock mencegah dua salinan hidup
+      bekerja bersamaan; seen-set adalah jalur cepat agar redelivery dalam 6 jam
+      tidak menyentuh D1 lagi. Bila binding DO tidak ada, claimChat()
+      mengembalikan null dan pipeline berjalan tanpa lock - D1 tetap menjadi
+      jaring pengaman.
+
+  9.3 Outbox lease (RENCANA FASE 5, skema sudah ada)
+      status pending/claimed/sent/failed + attempts + next_attempt_at +
+      claimed_until. Flush mengambil baris 'pending' yang siap, mengklaimnya
+      (claimed, claimed_until = sekarang + lease), lalu menandai 'sent' atau
+      'failed'. Lease membuat klaim milik worker yang mati kedaluwarsa dan bisa
+      diambil ulang, tanpa dua pengirim bekerja pada baris yang sama.
+
+  9.4 Yang TIDAK (belum) tertutup - jujur, harus diketahui
+      Ada satu jendela: bila wuzapi sudah menerima kirim tetapi worker mati
+      sebelum finishDelivery('done') ditulis, retry berikutnya akan mengirim
+      ulang balasan yang sama. Saat ini mitigasinya hanya "jendela sempit".
+      Hook yang sudah tersedia tetapi belum dipakai: sendText/sendImage/
+      sendDocument menerima opsi {id}, dan wuzapi memakai Id itu sebagai msgid
+      (wuzapi/handlers.go SendMessage: msgid = t.Id bila diisi) - artinya
+      idempotensi di sisi WhatsApp bisa ditegakkan dengan Id deterministik
+      per (deliveryId, indeks pesan). deliverOutbound() belum mengirimkan id.
+      Rekomendasi: pakai hook ini di FASE 5 bersama outbox lease.
+
+  9.5 idempotensi lain
+      messages.delivery_id UNIQUE  -> redelivery tidak menambah history kedua.
+      carts/cart_items PK per chat -> tidak ada cart ganda.
+      contacts/catalog_products PK -> upsert, bukan duplikat.
+      DLQ: pesan hanya di-ack setelah arsip R2 berhasil; arsip gagal -> retry
+      60 detik, jadi record tidak hilang.
+
+  9.6 Degradasi ke shadow saat konfigurasi belum lengkap (bukan idempotensi)
+      Bila BOT_MODE=on tetapi botReadiness() belum siap (mis. WUZAPI_TOKEN atau
+      AI_API_KEY kosong, CHAT_COORDINATOR tidak ada), pipeline TIDAK mengirim:
+      deliver = (mode == "on" && !degraded), dan setiap pesan mencatat log error
+      "bot_degraded_shadow" berisi daftar yang kurang. (BOT_DB yang tidak ada
+      sudah ditangani lebih dulu: log bot_misconfigured + ack "missing_bot_db".)
+      Pipeline tetap
+      berjalan (history tetap ditulis, balasan tetap muncul sebagai
+      outbound_suppressed_shadow), sehingga nomor yang salah konfigurasi diam
+      daripada mengirim balasan fallback generik ke customer. Konsekuensi
+      operasional: botMode=on + bot.ready=false di /healthz berarti TIDAK ADA
+      balasan yang keluar sampai konfigurasi dilengkapi.
+      Sumber: cloudflare/shared/src/bot/queue/handlers.ts.
+
+
+10. BATASAN YANG MENGIKAT
+-------------------------
+ 1. Tanpa GOWA, tanpa Go tambahan, tanpa RabbitMQ, tanpa PostgreSQL. Proyek ini
+    TypeScript di Cloudflare Workers; satu-satunya kode Go yang ada adalah wuzapi
+    itu sendiri.
+ 2. wuzapi TIDAK DIUBAH. Integrasi hanya lewat permukaan yang sudah ada:
+    webhook per nomor (URL + HMAC key dari dashboard) dan REST API
+    (/chat/send/text|image|document, /chat/presence, /user/contacts) dengan
+    header "token". Tidak ada patch, fork, atau plugin.
+ 3. Queue adalah SATU-SATUNYA transport event. Tidak ada HTTP pull consumer, DB
+    antrean, atau cron pengambil pesan.
+ 4. Satu nomor = satu Worker, satu Queue events, satu DLQ, satu bucket R2, satu
+    D1, satu KV, satu namespace DO, satu set secret. Tidak ada resource bersama
+    antar nomor selain paket kode cloudflare/shared/.
+ 5. Envelope v1 dan nama kind di bagian 3 dibekukan; perubahan bentuk berarti
+    versi baru (v2), bukan penambahan field diam-diam. Field baru yang opsional
+    masih boleh selama consumer lama tetap bisa membacanya.
+ 6. Bentuk payload wuzapi di bagian 4 dibekukan terhadap kode Go saat ini;
+    kalau wuzapi berubah, fixture HMAC dan uji kompatibilitas yang menangkapnya
+    (cloudflare/shared/test/go-compat.test.ts, tools/hmac-fixture).
+ 7. Tanpa secret di repo. Nilai hanya lewat `wrangler secret put` (produksi) dan
+    .dev.vars yang di-gitignore (lokal). Rotasi key diharapkan setelah setup.
+ 8. Batas platform yang membentuk desain: pesan queue maksimum 128 KB (karena
+    itu INLINE_MAX_BYTES = 90 KB dan media besar menjadi pointer R2), memori
+    Worker 128 MB (karena itu payload besar di-stream, tidak di-buffer), dan D1
+    tanpa transaksi interaktif (karena itu setiap statement harus idempoten).

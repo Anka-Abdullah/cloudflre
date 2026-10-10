@@ -1,0 +1,61 @@
+{
+  "fixtures": [
+    {
+      "name": "json-event-message",
+      "note": "Per-user webhook, WEBHOOK_FORMAT=json: body is json.Marshal of the event map resty sends verbatim.",
+      "contentType": "application/json",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "{\"event\":{\"Info\":{\"Chat\":\"6281234567890@s.whatsapp.net\",\"ID\":\"3EB0ABCDEF\",\"IsFromMe\":false,\"PushName\":\"Pelanggan \\u0026 Co\",\"Timestamp\":\"2026-10-10T07:15:00Z\"},\"Message\":{\"conversation\":\"Halo \\u003cadmin\\u003e \\\"tes\\\" \\u0026 terima kasih\\nbaris dua\"}},\"instanceName\":\"nomor-1\",\"type\":\"Message\",\"userID\":\"1\"}",
+      "signature": "9a5df517a23a1eb1f39eedd09f5d1e73128667e4b39f4554789a4227daa9a6f1"
+    },
+    {
+      "name": "json-global-webhook",
+      "note": "Global webhook (WUZAPI_GLOBAL_WEBHOOK) in JSON mode: jsonData stays a nested JSON string.",
+      "contentType": "application/json",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "{\"instanceName\":\"nomor-1\",\"jsonData\":\"{\\\"type\\\":\\\"Message\\\",\\\"event\\\":{\\\"Info\\\":{\\\"Chat\\\":\\\"6281234567890@s.whatsapp.net\\\",\\\"ID\\\":\\\"3EB0ABCDEF\\\",\\\"IsFromMe\\\":false,\\\"PushName\\\":\\\"Pelanggan \\u0026 Co\\\",\\\"Timestamp\\\":\\\"2026-10-10T07:15:00Z\\\"},\\\"Message\\\":{\\\"conversation\\\":\\\"Halo \\u003cadmin\\u003e \\\\\\\"tes\\\\\\\" \\u0026 terima kasih\\\\nbaris dua\\\"}}}\",\"userID\":\"1\"}",
+      "signature": "3683a9b9c5a176e0452f2f28f9ed02893c760462e0b9ede92c84fe3052099fe1"
+    },
+    {
+      "name": "json-event-unicode",
+      "note": "Unicode, newlines and HTML characters must survive Go's default HTML escaping byte-for-byte.",
+      "contentType": "application/json",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "{\"event\":{\"Message\":{\"conversation\":\"emoji 😀 \\u003cb\\u003e \\u0026 \\u003c/b\\u003e éè \\t tab\"}},\"instanceName\":\"nomor-é\",\"type\":\"Message\",\"userID\":\"1\"}",
+      "signature": "40f6bf7f09556f8e978f027330d947e7047b8feb175cda11969c8dec5bdce13f"
+    },
+    {
+      "name": "form-event-message",
+      "note": "Per-user webhook, default (form) mode: url.Values.Encode() output is both the signed string and the body.",
+      "contentType": "application/x-www-form-urlencoded",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "instanceName=nomor-1&jsonData=%7B%22type%22%3A%22Message%22%2C%22event%22%3A%7B%22Info%22%3A%7B%22Chat%22%3A%226281234567890%40s.whatsapp.net%22%2C%22ID%22%3A%223EB0ABCDEF%22%2C%22IsFromMe%22%3Afalse%2C%22PushName%22%3A%22Pelanggan+%26+Co%22%2C%22Timestamp%22%3A%222026-10-10T07%3A15%3A00Z%22%7D%2C%22Message%22%3A%7B%22conversation%22%3A%22Halo+%3Cadmin%3E+%5C%22tes%5C%22+%26+terima+kasih%5Cnbaris+dua%22%7D%7D%7D&userID=1",
+      "signature": "d59890251fba02b7e661dcd9dc9fb9c7c46040664b870bf90c03818d98129316"
+    },
+    {
+      "name": "form-special-characters",
+      "note": "Go query escaping: space becomes '+', '*' becomes %2A, '~' stays literal, unicode is percent-encoded.",
+      "contentType": "application/x-www-form-urlencoded",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "instanceName=nomor+satu&jsonData=%7B%22type%22%3A%22Message%22%2C%22event%22%3A%7B%22Message%22%3A%7B%22conversation%22%3A%22a+b+%2B+c+%26+d+%3D+e+%2A+f+~+g+%5Cu00e9%22%7D%7D%7D&userID=1",
+      "signature": "8e569a92a10596d1d6d4b4d5a6f50a4725d73920c1bf19991f5ebb52d8d61db2"
+    },
+    {
+      "name": "media-json-inline-base64",
+      "note": "Media event in JSON mode: base64 is streamed inline and the signature covers the raw body stream.",
+      "contentType": "application/json",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "{\"base64\":\"bWVkaWEtYnl0ZXMtZm9yLWZpeHR1cmUtAAEC\",\"event\":{\"Info\":{\"Chat\":\"6281234567890@s.whatsapp.net\",\"ID\":\"3EB0MEDIA\"},\"Message\":{\"imageMessage\":{\"mimetype\":\"image/jpeg\"}}},\"fileName\":\"IMG-0001.jpg\",\"instanceName\":\"nomor-1\",\"mimeType\":\"image/jpeg\",\"type\":\"Message\",\"userID\":\"1\"}",
+      "signature": "cb27dfeba8a74c26da8e1b40024287db48d2c8fcc75c27166d955f98bd4039c6"
+    },
+    {
+      "name": "media-form-with-file",
+      "note": "Media event in form mode: jsonData carries the media JSON escaped inline and the signature covers the raw body.",
+      "contentType": "application/x-www-form-urlencoded",
+      "key": "wuzapi-test-hmac-key-0123456789abcdef",
+      "body": "instanceName=nomor-1&jsonData=%7B%22base64%22%3A%22bWVkaWEtYnl0ZXMtZm9yLWZpeHR1cmUtAAEC%22%2C%22event%22%3A%7B%22Info%22%3A%7B%22Chat%22%3A%226281234567890%40s.whatsapp.net%22%2C%22ID%22%3A%223EB0MEDIA%22%7D%2C%22Message%22%3A%7B%22imageMessage%22%3A%7B%22mimetype%22%3A%22image%2Fjpeg%22%7D%7D%7D%2C%22fileName%22%3A%22IMG-0001.jpg%22%2C%22mimeType%22%3A%22image%2Fjpeg%22%2C%22type%22%3A%22Message%22%7D&userID=1",
+      "signature": "f12e4bc7fb1dd877efc215ca0b822a7bc9ae7ba828c7382ea8988186677a9f71"
+    }
+  ],
+  "generator": "cloudflare/tools/hmac-fixture"
+}

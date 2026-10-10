@@ -1,0 +1,28 @@
+{
+  "name": "wuzip-cloudflare",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.10.0",
+  "scripts": {
+    "new": "node scripts/new-instance.mjs",
+    "provision": "node scripts/provision.mjs",
+    "dev": "node scripts/instance.mjs dev",
+    "deploy": "node scripts/instance.mjs deploy",
+    "tail": "node scripts/instance.mjs tail",
+    "secrets": "node scripts/instance.mjs secrets",
+    "migrate": "node scripts/instance.mjs migrate",
+    "knowledge": "node scripts/instance.mjs knowledge",
+    "simulate": "node scripts/simulate-webhook.mjs",
+    "smoke:ai": "node scripts/smoke-ai.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.0",
+    "@cloudflare/workers-types": "^5.20261009.1",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.149.0"
+  }
+}

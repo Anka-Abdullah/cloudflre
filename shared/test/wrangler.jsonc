@@ -1,0 +1,88 @@
+{
+  "name": "wuzip-shared-test",
+  "main": "worker-entry.ts",
+  "compatibility_date": "2026-10-10",
+  "observability": { "enabled": false },
+  "vars": {
+    "INSTANCE_SLUG": "6281234567890",
+    "INLINE_MAX_BYTES": "90000",
+    "MEDIA_BUFFER_MAX_BYTES": "25000000",
+    "SCAN_MAX_FIELD_BYTES": "262144",
+    "HMAC_MODE": "strict",
+    "MEDIA_MODE": "r2",
+    "RELAY_MODE": "relay",
+    "RETRY_BASE_SECONDS": "15",
+    "RETRY_MAX_SECONDS": "3600",
+    "DLQ_QUEUE_NAME": "wuzip-shared-test-dlq",
+    "DOWNSTREAM_URL": "https://bot.example.test/wuzapi/events",
+    "R2_PUBLIC_BASE_URL": "",
+    "INGEST_TOKEN": "test-ingest-token-0123456789",
+    "WUZAPI_HMAC_KEYS": "wuzapi-test-hmac-key-0123456789abcdef",
+    "DOWNSTREAM_HMAC_KEY": "downstream-test-hmac-key",
+    "ALERT_WEBHOOK_URL": "",
+
+    "BOT_MODE": "shadow",
+    "WUZAPI_API_BASE": "https://wuzapi.example.test",
+    "AI_BASE_URL": "https://ai.example.test/v1",
+    "AI_MODEL": "cmc/deepseek/deepseek-v4.1-flash",
+    "AI_TIMEOUT_MS": "60000",
+    "AI_MAX_TURNS": "3",
+    "KNOWLEDGE_MODE": "auto",
+    "KNOWLEDGE_INLINE_MAX_BYTES": "1048576",
+    "KNOWLEDGE_TOP_K": "5",
+    "KNOWLEDGE_HISTORY_LIMIT": "10",
+    "CONTACT_SYNC_INTERVAL_MINUTES": "10",
+    "PAYMENT_PROVIDER": "sumopod",
+    "PAYMENT_API_BASE": "https://api-pay-sandbox.sumopod.com",
+    "PAYMENT_EXPIRES_HOURS": "24",
+    "PAYMENT_DRY_RUN": "true",
+    "TELEGRAM_ENABLED": "false",
+    "PUBLIC_BASE_URL": "https://wuzapi-6281234567890.example.workers.dev",
+    "BOT_MAX_ITEMS": "20",
+    "BOT_MAX_ITEM_QTY": "99",
+    "OUTBOX_BATCH": "20",
+    "RECONCILE_INTERVAL_MINUTES": "1",
+    "VOICE_ENABLED": "false",
+
+    "WUZAPI_TOKEN": "test-wuzapi-token",
+    "AI_API_KEY": "test-ai-key",
+    "TURSO_DATABASE_URL": "libsql://test.turso.io",
+    "TURSO_AUTH_TOKEN": "test-turso-token",
+    "PAYMENT_API_KEY": "test-payment-key",
+    "PAYMENT_CALLBACK_SECRET": "test-payment-callback-secret",
+    "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+    "TELEGRAM_CHAT_ID": "-1001234567890",
+    "TELEGRAM_WEBHOOK_SECRET": "test-telegram-secret",
+    "ADMIN_API_KEY": "test-admin-key"
+  },
+  "queues": {
+    "producers": [
+      { "binding": "EVENTS", "queue": "wuzip-shared-test-events" },
+      { "binding": "DLQ", "queue": "wuzip-shared-test-dlq" }
+    ],
+    "consumers": [
+      {
+        "queue": "wuzip-shared-test-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "wuzip-shared-test-dlq"
+      },
+      { "queue": "wuzip-shared-test-dlq", "max_batch_size": 10, "max_retries": 3 }
+    ]
+  },
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "wuzip-shared-test-media" }],
+  "d1_databases": [
+    {
+      "binding": "BOT_DB",
+      "database_name": "wuzipbot-bot-6281234567890",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../shared/src/bot/migrations"
+    }
+  ],
+  "kv_namespaces": [{ "binding": "KNOWLEDGE_KV", "id": "wuzip-shared-test-knowledge" }],
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT_COORDINATOR", "class_name": "ChatCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatCoordinator"] }]
+}

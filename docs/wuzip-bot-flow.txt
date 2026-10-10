@@ -1,0 +1,516 @@
+wuzip-bot-flow.txt - alur bisnis end-to-end bot WhatsApp (wuzapi + Cloudflare Queue)
+====================================================================================
+Ruang lingkup : alur pesan customer, urutan pipeline bot, keputusan ack/retry/DLQ,
+                alur checkout/payment (rencana), dan status tiap fase.
+Pasangan      : wuzip-bot-architecture.txt (kontrak queue, skema, env & secret)
+                wuzip-bot-runbook.txt       (operasi harian, troubleshooting)
+Path          : semua path di dokumen ini relatif terhadap root repo
+                /Users/ank/project/wuzip-bot
+Status        : FASE 0-2 SUDAH ADA kodenya. FASE 3-9 BELUM ADA; setiap bagian
+                yang belum ada ditandai "RENCANA (FASE n)".
+Aturan        : tidak ada nilai secret di dokumen ini, hanya nama variabel.
+
+
+0. STATUS FASE PER AKHIR SESI INI
+---------------------------------
++------+--------------------------------------------------+---------------------------+
+| Fase | Isi                                              | Status bukti              |
++------+--------------------------------------------------+---------------------------+
+| 0    | kontrak Queue v1, skema D1 0001_init.sql,        | ADA - dibekukan           |
+|      | pembuktian D1 FTS5/bm25/unicode61                | shared/test/d1.test.ts    |
+| 1    | ingest /ingest/<token> + HMAC + R2 + relay +     | ADA                       |
+|      | consumer DLQ                                     | shared/src/ingest/*,      |
+|      |                                                  | shared/src/consumer/*     |
+| 2    | pipeline bot tanpa AI: filter, policy no_ai,     | ADA                       |
+|      | lock Durable Object, idempotensi D1, history,    | shared/src/bot/**         |
+|      | outbound + token bucket, BOT_MODE off/shadow/on  |                           |
+| 3    | knowledge (prompt.txt/knowledge.txt) + AI agent  | BELUM ADA - RENCANA       |
+| 4    | cart + kontak sync (no_ai periodik)              | BELUM ADA - RENCANA       |
+| 5    | Turso + Sumopod + Telegram + outbox flush        | BELUM ADA - RENCANA       |
+| 6    | nota PDF + rate limit lanjutan + typing          | BELUM ADA - RENCANA       |
+| 7    | cron/reconcile + DLQ lanjutan + observability    | BELUM ADA - RENCANA (1)   |
+| 8    | tidak dirujuk kode maupun brief ini              | PERLU KONFIRMASI          |
+| 9    | voice note (transkripsi audio)                   | BELUM ADA - RENCANA       |
++------+--------------------------------------------------+---------------------------+
+(1) Consumer DLQ dasar SUDAH ADA di cloudflare/shared/src/consumer/dlq.ts (arsip ke
+    R2 + alert). Yang belum ada di FASE 7 adalah cron/scheduled handler dan
+    observability lanjutan (metrik, rekonsiliasi). Lihat bagian 6.
+
+Yang benar-benar sudah berjalan hari ini pada BOT_MODE=shadow|on: filter, policy,
+lock, idempotensi, history, dan pengiriman balasan. Balasan yang dikirim BUKAN
+jawaban AI: cloudflare/shared/src/bot/agent/run.ts mengembalikan fallbackReply()
+deterministik dan mencatat log "ai_unavailable" (reason "responder_is_fallback")
+pada setiap pesan; FASE 3 menggantinya dengan prompt + tool calling tanpa
+mengubah kontrak Responder/ReplyPlan.
+
+
+1. ALUR A - CUSTOMER SAMPAI KE QUEUE (SUDAH ADA)
+------------------------------------------------
+Setiap langkah di bawah bisa dilacak ke kode.
+
+  1. Customer mengirim pesan WhatsApp ke nomor bisnis.
+  2. wuzapi (Go, per nomor) menerima event whatsmeow. myEventHandler()
+     (wuzapi/wmiau.go) membangun postmap:
+         postmap["event"] = <event mentah whatsmeow>
+         postmap["type"]  = "Message"
+     lalu sendEventWithWebHook() memeriksa langganan event nomor itu dan
+     memanggil sendToUserWebHookWithHmac().
+  3. Transport webhook (wuzapi/helpers.go callHookWithHmac) memilih bentuk body:
+       - WEBHOOK_FORMAT=form (default): application/x-www-form-urlencoded dengan
+         field jsonData=<postmap sebagai string JSON>&userID=..&instanceName=..
+       - WEBHOOK_FORMAT=json        : application/json berisi postmap apa adanya
+     HMAC-SHA256 dihitung atas byte body yang benar-benar dikirim dan dikirim
+     sebagai header "x-hmac-signature". wuzapi mengulang webhook sampai
+     WEBHOOK_RETRY_COUNT kali bila tidak melihat 2xx.
+  4. Worker menerima POST /ingest/<INGEST_TOKEN>
+     (cloudflare/shared/src/worker.ts, shared/src/ingest/handler.ts).
+       a. Token di path dibandingkan dengan secret INGEST_TOKEN memakai
+          perbandingan waktu-tetap. Salah -> 401.
+       b. Method harus POST (else 405); Content-Type harus application/json,
+          *+json, atau x-www-form-urlencoded (else 415).
+       c. HMAC_MODE=strict: header x-hmac-signature wajib ada (else 403). Bila
+          WUZAPI_HMAC_KEYS kosong -> 500 ingest_misconfigured.
+       d. Body dibaca sampai INLINE_MAX_BYTES (default 90.000 byte).
+  5. Payload kecil (<= INLINE_MAX_BYTES):
+       - HMAC diverifikasi terhadap SEMUA key di WUZAPI_HMAC_KEYS (rotasi tanpa
+         downtime); gagal -> 403.
+       - deliveryId = sha256(raw body) dalam hex. Nilai ini stabil terhadap
+         pengulangan webhook wuzapi, jadi bisa dipakai untuk dedup.
+       - Body di-parse oleh parseWebhookBody() (shared/src/ingest/parse.ts):
+         bentuk form maupun json dinormalisasi menjadi payload postmap.
+       - Envelope v1 kind="event" dikirim ke queue EVENTS -> jawaban 202.
+       - Bila env.EVENTS.send() gagal -> 503 supaya wuzapi mengulang.
+  6. Payload besar (> INLINE_MAX_BYTES):
+       - MEDIA_MODE=reject -> 413 + satu record DLQ (stage "ingest").
+       - Ada Content-Length -> satu kali baca: stream ke R2 lewat FixedLengthStream
+         sambil menghitung HMAC streaming, sha256, dan scan JSON top-level (field
+         "base64" diukur ukurannya, tidak ditampung). Envelope menjadi
+         kind="media-pointer" berisi r2Key/size/sha256/skippedFields/fields.
+       - Tanpa Content-Length -> di-buffer sampai MEDIA_BUFFER_MAX_BYTES
+         (default 25 MB); lebih dari itu -> 413 + record DLQ.
+       - Objek R2: events/<slug>/<YYYY>/<MM>/<DD>/<uuid>.json|.form.
+       - Kalau R2.put() gagal -> 500 supaya wuzapi mengulang.
+  7. Queue EVENTS (nama: wuzapi-<nomor>-events) menyimpan envelope. Consumer
+     adalah worker yang sama (push consumer), max_batch_size 20,
+     max_batch_timeout 5 detik, max_retries 5, retry_delay 30 detik, DLQ
+     wuzapi-<nomor>-dlq.
+  8. Worker memanggil queue() (shared/src/worker.ts):
+       - Bila nama queue = DLQ (DLQ_QUEUE_NAME, default berakhiran "-dlq"):
+         handleDlqBatch() -> arsip ke R2 _dlq/<slug>/<tanggal>/<messageId>.json,
+         opsional POST ke ALERT_WEBHOOK_URL, baru ack. Arsip gagal -> retry 60 s.
+       - BOT_MODE=off -> handleEventsBatch() (relay ke DOWNSTREAM_URL).
+       - BOT_MODE=shadow|on -> handleBotBatch() (pipeline bot, bagian 2).
+       - Config tidak valid -> log queue_config_invalid + ackAll() (retry tidak
+         akan pernah berhasil).
+  9. Pemilihan mode TIDAK mengubah bentuk envelope. Satu nomor bisa berpindah
+     relay <-> bot tanpa menyentuh ingest maupun wuzapi.
+
+
+2. ALUR B - PIPELINE BOT (SUDAH ADA, URUTAN INI ADALAH DESAINNYA)
+-----------------------------------------------------------------
+Urutan ringkas (persis seperti komentar modul shared/src/bot/queue/handlers.ts):
+
+    filter -> policy -> lock -> idempotensi -> history -> responder -> deliver
+           -> settle
+
+  1. Router (shared/src/bot/queue/router.ts) memeriksa isEnvelopeV1(body).
+     Bukan envelope v1 -> log bot_poison_message, arsip ke DLQ, ack.
+  2. kind "event" | "media-pointer" | "wuzapi.event" (isWuzapiEventKind) ->
+     handleWuzapiEvent(); kind "payment.event" -> handlePaymentEvent(); kind
+     "outbox.tick" -> handleOutboxTick(); kind lain -> log bot_unknown_kind,
+     arsip DLQ, ack.
+  3. log "event_received" (deliveryId, kind, eventType, mode).
+  4. payloadOf(): pakai envelope.event.payload; bila null (media-pointer) pakai
+     envelope.media.fields. Jadi filter selalu melihat objek postmap.
+  5. filterInbound() (shared/src/bot/filter.ts), paling murah lebih dulu:
+       a. envelope.event.type harus null atau "Message" -> else not_message.
+       b. messageEventOf(): payload harus punya event.Info DAN event.Message
+          (event mentah tanpa pembungkus juga diterima) -> else not_message.
+       c. Info.Chat kosong -> unsupported_chat.
+       d. Info.IsFromMe === true -> from_me (menghentikan echo balasan bot).
+       e. chatRejection(): @g.us/IsGroup -> group; @newsletter -> newsletter;
+          status@broadcast -> status; @broadcast lain -> broadcast; server bukan
+          s.whatsapp.net atau lid -> unsupported_chat; chat diawali "0@" ->
+          unsupported_chat.
+       f. extractBody() (shared/src/bot/text.ts) membuka wrapper ephemeralMessage,
+          viewOnceMessage(V2/V2Extension), documentWithCaptionMessage,
+          editedMessage, lalu membaca teks. Tidak ada teks -> unsupported_message.
+       g. audio + VOICE_ENABLED=false -> voice_disabled.
+       h. body kosong -> empty_body.
+     Hasil: InboundMessage {chatJid, senderJid, waMessageId, pushName,
+     timestamp, kind, body}. Gagal -> log "event_filtered" + ack.
+  6. Tanpa binding BOT_DB -> log bot_misconfigured(reason BOT_DB binding is
+     missing) dan ack reason "missing_bot_db": tanpa D1 tidak ada cara mencatat,
+     jadi menjawab berisiko mengirim balasan dobel pada pengiriman ulang.
+  7. botReadiness(config, env) (shared/src/config.ts): bila ada yang kosong
+     (WUZAPI_API_BASE, WUZAPI_TOKEN, AI_BASE_URL, AI_MODEL, AI_API_KEY) atau
+     binding BOT_DB/CHAT_COORDINATOR hilang -> log bot_misconfigured berisi
+     daftar nama yang kurang, lalu LANJUT (bukan ack/retry). BOT_DB sudah
+     ditangani di langkah 6, jadi di sini yang realistis tinggal
+     CHAT_COORDINATOR (dan config yang kosong).
+     Bila BOT_MODE=on DAN readiness belum siap -> degraded=true, log error
+     "bot_degraded_shadow", dan deliver dipaksa false (langkah 18): pipeline
+     tetap jalan dan history tetap ditulis, tetapi tidak ada balasan yang
+     dikirim ke customer sampai konfigurasi dilengkapi. BOT_MODE=shadow tidak
+     terpengaruh (memang sudah tidak mengirim).
+  8. resolveChatPolicy() (shared/src/bot/contacts/policy.ts), urutan keputusan:
+       a. baris di suppressed_chats            -> "suppressed"
+       b. contacts.has_no_ai = 1               -> "no_ai_contact"
+       c. Info.PushName mengandung "no_ai"     -> "no_ai_pushname"
+          (case-insensitive substring; berlaku langsung tanpa menunggu sync)
+       d. chat_state.bot_enabled = 0           -> "bot_disabled"
+     Ditolak -> log "event_suppressed" + ack.
+  9. isDeliveryDone(): baris processed_events berstatus 'done' -> log
+     "event_duplicate" + ack (jalur cepat, AI tidak pernah dipanggil lagi).
+ 10. claimChat() ke Durable Object ChatCoordinator (shared/src/bot/
+     coordinator/chat-lock.ts), idFromName(chatJid):
+       - locked=false (ada pemegang lock lain) -> log "event_locked" +
+         retry dengan delay = ceil(retryAfterMs/1000), minimal 1 detik.
+       - duplicate=true (deliveryId ada di seen-set 6 jam) -> release lock tanpa
+         rememberDelivery, log "event_duplicate" (source coordinator), ack.
+       - binding CHAT_COORDINATOR tidak ada -> claimChat() mengembalikan null dan
+         pipeline lanjut tanpa lock; D1 tetap menjadi jaring pengaman.
+ 11. claimDelivery() D1 (shared/src/bot/idempotency.ts):
+       INSERT OR IGNORE INTO processed_events (... status 'processing') ->
+         berhasil = delivery baru, lanjut.
+       Gagal insert (baris sudah ada) -> UPDATE ... SET status='processing'
+         WHERE delivery_id=? AND status <> 'done' -> berhasil = klaim ulang
+         setelah crash/outage.
+       Keduanya gagal (baris 'done') -> release lock dengan rememberDelivery=true,
+         log "event_duplicate" (source d1), ack.
+ 12. log "event_processing" (deliveryId, chatJid, kind, mode).
+ 13. ensureChatState(): buat baris chat_state pertama kali, perbarui
+     last_inbound_at (ON CONFLICT DO UPDATE, aman diulang).
+ 14. loadHistory(chatJid, KNOWLEDGE_HISTORY_LIMIT) DIBACA SEBELUM pesan saat ini
+     ditulis.
+ 15. recordInbound(): INSERT OR IGNORE INTO messages dengan delivery_id UNIQUE,
+     jadi pengiriman ulang tidak menambah baris history kedua (ditegakkan
+     database, bukan pre-check yang bisa balapan).
+ 16. ReplyContext dibentuk; history disaring withoutCurrent() supaya pada retry
+     pertanyaan yang sama tidak muncul dua kali di prompt.
+ 17. responder(context) -> ReplyPlan {messages, reason}:
+       - hari ini: fallbackReply() deterministik (log "ai_unavailable",
+         reason "fallback_reply"); tidak pernah menyebut harga/stok.
+       - RENCANA (FASE 3): loop prompt + tool calling di
+         cloudflare/shared/src/bot/agent/prompt.ts, agent/llm.ts, dan
+         agent/tools.ts (disebut di komentar modul agent/run.ts); kontrak
+         Responder/ReplyPlan tidak berubah sehingga downstream tidak ikut
+         berubah.
+ 18. deliverOutbound() (shared/src/bot/outbound.ts):
+       - messages kosong -> tidak ada yang dikirim.
+       - deliver=false -> log "outbound_suppressed_shadow", outcome
+         suppressed=true; customer tidak menerima apa pun. deliver=false terjadi
+         saat BOT_MODE=shadow, DAN saat BOT_MODE=on tetapi konfigurasi belum
+         lengkap (degradasi; langkah 7).
+       - Setiap pesan mengambil token dari token bucket Durable Object
+         idFromName("__rate__:<slug>"): kapasitas 30, refill 0,5 token/detik
+         (kira-kira 30 pesan/menit), maksimal 3 percobaan tunggu x 5 detik.
+         Bucket habis -> log "rate_limited", pesan dihitung gagal (permanent=false).
+       - Kirim lewat WuzapiClient: POST /chat/send/text | /chat/send/image |
+         /chat/send/document dengan header "token", timeout AI_TIMEOUT_MS,
+         ladder retry internal 1 s/2 s/4 s untuk 408/425/429/5xx/error jaringan.
+       - Sukses -> log "outbound_sent" (messageId dari data.Id wuzapi).
+       - Gagal -> log "outbound_failed" (status, attempts, permanent).
+ 19. Klasifikasi hasil outbound:
+       - semua kegagalan permanent (4xx) -> log "outbound_incomplete" +
+         "outbound_permanent"; settle status 'failed'; ack reason
+         "outbound_permanent". Mengulang panggilan yang sama tidak akan berhasil,
+         dan lock dilepas supaya pesan berikutnya tidak tertahan.
+       - ada kegagalan non-permanent -> finishDelivery('failed'), release lock
+         TANPA rememberDelivery, retry 15 detik (supaya klaim ulang mungkin).
+       - sukses -> recordOutbound() + touchOutbound() untuk tiap pesan yang
+         terkirim, lalu settle:
+ 20. settle(): finishDelivery(deliveryId, 'done') + releaseChat dengan
+     rememberDelivery=true (seen-set DO 6 jam).
+ 21. log "event_done" (replies, reason, shadow) dan router memanggil ack.
+ 22. Exception di mana pun -> log "event_failed", finishDelivery('failed'),
+     releaseChat tanpa remember, retry 30 detik.
+ 23. Router menaikkan delay retry: delaySeconds = max(delay dari handler,
+     retryDelaySeconds(attempts, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS) + jitter),
+     lalu log "bot_retry" dan message.retry(). Setelah max_retries (5) habis,
+     Cloudflare memindahkan pesan ke DLQ -> diarsipkan consumer DLQ.
+ 24. Exception tak terduga dari handler payment/outbox (FASE 5) -> log
+     "bot_handler_crashed" dan retry 30 detik; handleWuzapiEvent sendiri tidak
+     pernah melempar.
+
+MENGAPA URUTANNYA BEGITU
+
+  * Yang murah lebih dulu. filterInbound() adalah pengecekan CPU murni dan
+    resolveChatPolicy() hanya 4 SELECT kecil. Grup, status, newsletter,
+    broadcast, dan echo balasan bot sendiri ditolak sebelum lock, sebelum
+    history, dan sebelum satu sen biaya AI keluar. Pada nomor yang ramai, bagian
+    terbesar trafik berhenti di langkah 5-8.
+  * Lock diambil SEBELUM AI, bukan sesudah. Cloudflare Queues bersifat
+    at-least-once, jadi dua salinan webhook yang sama bisa berjalan bersamaan.
+    Tanpa lock, keduanya sama-sama lolos isDeliveryDone() dan sama-sama memanggil
+    model: biaya dobel dan dua balasan ke customer yang sama. Lock per chat
+    (Durable Object, satu instance = satu event loop) membuat yang kedua
+    menunggu/retry, bukan bekerja paralel.
+  * Claim D1 sesudah lock, sebelum kerja mahal. Ini yang membuat kegagalan bisa
+    di-retry dan kesuksesan bersifat permanen: yang memblokir hanya status
+    'done'. Baris 'processing'/'failed' boleh diklaim ulang, sehingga wuzapi
+    outage atau worker crash tetap bisa dilanjutkan, sementara balasan yang
+    sudah benar-benar terkirim tidak pernah diulang.
+  * History dibaca sebelum pesan sekarang ditulis. Kalau urutannya dibalik, model
+    melihat pertanyaannya dua kali (sekali sebagai history, sekali sebagai pesan
+    baru); withoutCurrent() adalah sabuk pengaman kedua untuk retry.
+  * Kirim paling akhir, settle paling akhir sekali lagi. Tidak ada yang keluar
+    sebelum balasan selesai disusun, dan status 'done' ditulis setelah kirim
+    berhasil. Kalau 'done' ditulis lebih awal, crash setelah tulisan itu tetapi
+    sebelum kirim akan membuat balasan hilang selamanya (delivery sudah
+    dianggap selesai).
+  * Kegagalan permanen di-ack, bukan di-retry. wuzapi yang menjawab 4xx tidak
+    akan berubah pikiran pada percobaan ke-5; meneruskan retry hanya
+    menghabiskan jatah attempts dan menahan lock chat.
+
+
+3. TABEL KEPUTUSAN: ACK vs RETRY vs DLQ (PIPELINE BOT)
+------------------------------------------------------
++------------------------------------------+----------+-------------------------------+
+| Kondisi                                  | Keputusan| Alasan / log                  |
++------------------------------------------+----------+-------------------------------+
+| Body bukan EnvelopeV1                    | ack+DLQ  | bot_poison_message            |
+| kind tidak dikenal                       | ack+DLQ  | bot_unknown_kind              |
+| type != "Message"                        | ack      | event_filtered:not_message    |
+| payload bukan event pesan (tanpa Info)   | ack      | event_filtered:not_message    |
+| chat grup / newsletter / status /        | ack      | event_filtered:<reason>       |
+| broadcast / server tak dikenal           |          |                               |
+| Info.IsFromMe = true (echo bot)          | ack      | event_filtered:from_me        |
+| pesan tanpa teks (reaksi, protokol,      | ack      | event_filtered:               |
+| stiker/gambar tanpa caption)             |          | unsupported_message           |
+| audio + VOICE_ENABLED=false              | ack      | event_filtered:voice_disabled |
+| body kosong                              | ack      | event_filtered:empty_body     |
+| BOT_DB tidak ada                         | ack      | bot_misconfigured +           |
+|                                          |          | reason missing_bot_db         |
+| config bot belum lengkap (readiness)     | lanjut   | bot_misconfigured; bila       |
+|                                          |          | mode=on -> bot_degraded_      |
+|                                          |          | shadow + TIDAK mengirim       |
+| suppressed_chats / no_ai / bot_enabled=0 | ack      | event_suppressed:<reason>     |
+| delivery sudah 'done' (jalur cepat)      | ack      | event_duplicate               |
+| lock chat dipegang pengiriman lain       | retry    | event_locked, delay >= 1 s    |
+| deliveryId ada di seen-set DO (6 jam)    | ack      | event_duplicate (coordinator) |
+| baris processed_events sudah 'done'      | ack      | event_duplicate (d1)          |
+| token bucket habis (3 x tunggu <= 5 s)   | retry    | rate_limited, 15 s            |
+| kirim gagal, SEMUA 4xx (permanent)       | ack      | outbound_permanent, status    |
+|                                          |          | delivery diset 'failed'       |
+| kirim gagal, ada yang non-permanent      | retry    | outbound_incomplete, 15 s     |
+| exception di handler                     | retry    | event_failed, 30 s            |
+| sukses                                   | ack      | event_done                    |
+| payment.event (FASE 5 belum ada)         | ack      | payment_event_phase5          |
+| outbox.tick (FASE 5 belum ada)           | ack      | outbox_tick_phase5            |
+| handler payment/outbox melempar          | retry    | bot_handler_crashed, 30 s     |
+| attempts mencapai max_retries (5)        | DLQ      | dipindahkan Cloudflare        |
++------------------------------------------+----------+-------------------------------+
+Catatan: retry dari router selalu memakai max(delay handler, backoff + jitter),
+jadi "15 s"/"30 s" adalah nilai minimum, bukan nilai final.
+Tabel keputusan jalur relay (BOT_MODE=off) ada di bagian 4.
+
+
+4. JALUR RELAY BOT_MODE=off (SUDAH ADA, PERILAKU LAMA)
+------------------------------------------------------
++---------------------------------------+--------------------------------------+
+| Hasil dari DOWNSTREAM_URL             | Aksi                                 |
++---------------------------------------+--------------------------------------+
+| 2xx                                   | ack (log relay_delivered)            |
+| 408/425/429/5xx/error jaringan/timeout| retry + backoff (relay_retry /       |
+|                                       | relay_network_error)                 |
+| 4xx lain (400,401,403,404,413,422,...)| ack + DLQ (relay_rejected)           |
+| status tak terklasifikasi (mis. 3xx)  | ack + DLQ (relay_unexpected_status)  |
+| RELAY_MODE=observe                    | ack saja, tanpa HTTP (relay_observed)|
+| DOWNSTREAM_URL kosong                 | ack + DLQ (relay_misconfigured)      |
+| body bukan envelope v1                | ack + DLQ (relay_poison_message)     |
++---------------------------------------+--------------------------------------+
+Relay mengirim envelope apa adanya sebagai application/json dengan header
+x-wuzip-signature (sha256=HMAC-SHA256 body, key DOWNSTREAM_HMAC_KEY),
+x-wuzip-delivery-id, x-wuzip-attempt, x-wuzip-queue-message-id, x-wuzip-slug,
+x-wuzip-kind, x-wuzip-event-type, x-wuzip-user-id.
+
+
+5. NASIB TIAP JENIS PESAN MASUK
+-------------------------------
++-----------------------------+-------------+---------------------------+-----------------+
+| Bentuk masuk                | kind        | Nasib                     | Bukti           |
++-----------------------------+-------------+---------------------------+-----------------+
+| 1:1 teks (conversation)     | text        | diproses; balasan         | text.ts         |
+| 1:1 teks (extendedText)     | text        | diproses; menang atas     | text.ts urutan  |
+|                             |             | conversation kosong       | ekstraksi       |
+| caption image/video/document| caption     | diproses (media-nya       | text.ts         |
+|                             |             | sendiri tidak diunduh)    | captionOf()     |
+| balasan tombol              | button      | diproses; teks diambil    | text.ts         |
+| (buttons/templateButton)    |             | dari selectedDisplayText  |                 |
+| pilihan list                | list        | diproses; title atau      | text.ts         |
+|                             |             | selectedRowId             |                 |
+| audio / voice note          | audio       | DITOLAK: voice_disabled   | filter.ts       |
+|                             |             | bila VOICE_ENABLED=false; |                 |
+|                             |             | bila true pun body kosong |                 |
+|                             |             | -> empty_body (FASE 9)    |                 |
+| grup (@g.us atau IsGroup)   | -           | DITOLAK: group            | filter.ts       |
+| status (status@broadcast)   | -           | DITOLAK: status           | filter.ts       |
+| newsletter (@newsletter)    | -           | DITOLAK: newsletter       | filter.ts       |
+| broadcast lain              | -           | DITOLAK: broadcast        | filter.ts       |
+| pesan dari perangkat sendiri| -           | DITOLAK: from_me          | filter.ts       |
+| (IsFromMe=true)             |             |                           |                 |
+| body kosong (teks "")       | text        | DITOLAK: empty_body       | filter.ts       |
+| reaksi/protokol/stiker/     | -           | DITOLAK: unsupported_     | text.ts -> null |
+| gambar tanpa caption        |             | message                   |                 |
+| chat diawali "0@" atau      | -           | DITOLAK: unsupported_chat | filter.ts       |
+| server di luar s.whatsapp.  |             |                           |                 |
+| net / lid                   |             |                           |                 |
+| event non-Message           | -           | DITOLAK: not_message      | filter.ts       |
+| (Connected, Receipt, QR,...)|             |                           |                 |
+| ephemeral / view-once       | text dst.   | DIBUKA wrapper-nya lalu   | text.ts         |
+|                             |             | diproses normal           | unwrapMessage() |
+| media besar (media-pointer) | sesuai isi  | diproses dari             | handlers.ts     |
+|                             |             | media.fields; bila fields | payloadOf()     |
+|                             |             | null (tak bisa diparse    |                 |
+|                             |             | atau fieldsOmitted=true)  |                 |
+|                             |             | -> tidak ada Info ->      |                 |
+|                             |             | not_message               |                 |
++-----------------------------+-------------+---------------------------+-----------------+
+Semua penolakan hanya menjadi log "event_filtered" (atau "event_suppressed")
+dan pesan queue di-ack; tidak ada balasan yang dikirim ke customer.
+
+
+6. ALUR CHECKOUT / PAYMENT - RENCANA (FASE 5), BELUM ADA KODENYA
+----------------------------------------------------------------
+Tidak ada satu pun baris kode checkout/payment di repo ini per akhir sesi.
+Yang SUDAH ADA dan bisa dipakai FASE 5:
+  - skema D1: tabel carts, cart_items, catalog_products, outbox
+    (cloudflare/shared/src/bot/migrations/0001_init.sql) - belum ada kode yang
+    menulis/membacanya;
+  - konfigurasi: PAYMENT_PROVIDER=sumopod, PAYMENT_API_BASE,
+    PAYMENT_EXPIRES_HOURS, PAYMENT_DRY_RUN, PUBLIC_BASE_URL, BOT_MAX_ITEMS,
+    BOT_MAX_ITEM_QTY, OUTBOX_BATCH, RECONCILE_INTERVAL_MINUTES, TELEGRAM_ENABLED
+    (cloudflare/shared/src/config.ts);
+  - secret (nama saja): TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, PAYMENT_API_KEY,
+    PAYMENT_CALLBACK_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_WEBHOOK_SECRET, ADMIN_API_KEY;
+  - kind envelope "payment.event" dan "outbox.tick" sudah beku dan sudah
+    di-ack dengan aman (reason payment_event_phase5 / outbox_tick_phase5);
+  - WuzapiClient.sendPresence("composing"|"paused") sudah ada tetapi belum
+    dipanggil dari mana pun.
+
+Rencana langkah (semua langkah bertanda * belum ada kodenya):
+
+  1. * Customer menyusun cart di D1 (FASE 4): carts + cart_items; harga SELALU
+       dibaca ulang dari catalog_products saat menulis, tidak pernah dari teks
+       bebas AI.
+  2. * Customer mengetik "checkout" -> order dibuat di Turso dengan status
+       "creating" (baris ditulis lebih dulu supaya retry tidak membuat order
+       ganda).
+  3. * Ringkasan order + total (integer rupiah) dikirim ke customer lewat
+       deliverOutbound(); typing indicator (sendPresence) menyala di sini.
+  4. * Status "awaiting_approval": kartu persetujuan dikirim ke admin lewat
+       Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID). Bila TELEGRAM_ENABLED
+       false, alur harus punya jalur alternatif (auto-approve atau /admin/*).
+  5. * Admin menyetujui -> status "approved"; menolak -> "rejected" (order
+       selesai, customer diberi tahu).
+  6. * Bila PAYMENT_DRY_RUN=true: tautan pembayaran dibangun dan hanya dicatat di
+       log, gateway tidak dipanggil. Bila false: panggil Sumopod
+       (PAYMENT_API_BASE + PAYMENT_API_KEY) dan simpan referensi + checkout URL.
+  7. * Status "pending": order menunggu pembayaran; expires_at = sekarang +
+       PAYMENT_EXPIRES_HOURS (default 24 jam).
+  8. * Gateway memanggil balik worker (callback ditandatangani
+       PAYMENT_CALLBACK_SECRET). Callback diverifikasi, lalu satu envelope
+       kind="payment.event" dikirim ke queue EVENTS (belum ada route-nya di
+       worker.ts). Handler FASE 5 (saat ini ack) akan memprosesnya.
+  9. * Callback valid + nominal cocok -> status "paid". Nominal tidak cocok atau
+       signature salah -> tidak ada perubahan status, dicatat, dan (bila perlu)
+       eskalasi ke admin.
+ 10. * Order yang kedaluwarsa -> "expired"; kegagalan teknis setelah beberapa
+       percobaan -> "failed"; order baru yang menggantikan order lama ->
+       "superseded" (order lama menyimpan penunjuk ke penggantinya).
+ 11. * Nota PDF (FASE 6) dibuat dari order "paid" dan dikirim sebagai
+       OutboundDocument lewat outbox.
+ 12. * outbox flush: cron (FASE 7) dan/atau envelope "outbox.tick" mengambil
+       baris outbox berstatus 'pending' dengan next_attempt_at <= sekarang,
+       mengklaimnya (status 'claimed', claimed_until = lease), mengirim lewat
+       WuzapiClient, lalu 'sent' atau 'failed' dengan attempts bertambah.
+
+Arti status order (dibekukan):
++--------------------+------------------------------------------------------------+
+| status             | arti                                                       |
++--------------------+------------------------------------------------------------+
+| creating           | baris order dibuat, isi/ringkasan belum final              |
+| awaiting_approval  | menunggu keputusan admin (kartu Telegram)                  |
+| approved           | admin menyetujui; siap membuat tautan pembayaran           |
+| rejected           | admin menolak; order berhenti di sini                      |
+| pending            | tautan pembayaran sudah dikirim, menunggu callback gateway |
+| paid               | callback gateway valid dan nominal cocok                   |
+| expired            | melewati expires_at sebelum dibayar                        |
+| failed             | gagal teknis (gateway error, retry habis, data tidak sah)  |
+| superseded         | digantikan order yang lebih baru                           |
++--------------------+------------------------------------------------------------+
+Transisi yang diizinkan: creating -> awaiting_approval -> approved|rejected;
+approved -> pending; pending -> paid|expired|failed; awaiting_approval|pending ->
+superseded. Transisi lain harus ditolak handler, bukan "diperbaiki" diam-diam.
+
+File yang akan dibuat di FASE 5 (usulan nama, belum ada):
+  cloudflare/shared/src/bot/cart/store.ts        (FASE 4, dipakai di sini)
+  cloudflare/shared/src/lib/turso.ts             klien HTTP libsql
+  cloudflare/shared/src/bot/orders/store.ts      orders + order_items
+  cloudflare/shared/src/bot/payment/sumopod.ts   buat tautan + verifikasi callback
+  cloudflare/shared/src/bot/telegram/client.ts   kartu persetujuan admin
+  cloudflare/shared/src/bot/outbox/flush.ts      klaim lease + kirim + tandai
+  route baru di cloudflare/shared/src/worker.ts  (mis. /payment/callback,
+                                                 /telegram/webhook, /admin/*)
+
+
+7. RINGKASAN FASE 3-9: YANG BELUM ADA KODENYA + FILE YANG AKAN DIBUAT
+---------------------------------------------------------------------
+FASE 3 - knowledge + AI agent (BELUM ADA)
+  - Script sync knowledge: cloudflare/scripts/sync-knowledge.mjs. Perintah
+    "pnpm run knowledge" sudah ada di scripts/instance.mjs tetapi sengaja gagal
+    dengan pesan "scripts/sync-knowledge.mjs is not present yet (phase 3)".
+  - Sumber: prompt.txt (system prompt) dan knowledge.txt (Produk:/Harga:/Ongkir:)
+    di cloudflare/<nomor>/.
+  - Modul (usulan nama, belum ada): cloudflare/shared/src/bot/knowledge/sync.ts
+    (isi KV/R2 + isi knowledge_chunks/catalog_products),
+    cloudflare/shared/src/bot/knowledge/search.ts (FTS5 + bm25 atau kv_inline),
+    cloudflare/shared/src/bot/agent/prompt.ts (system prompt + aturan harga),
+    cloudflare/shared/src/bot/agent/llm.ts (loop prompt + tool calling,
+    menggantikan fallbackReply), cloudflare/shared/src/bot/agent/tools.ts
+    (get_price, cek stok, buat cart).
+  - Indeks FTS5 dibuat lazy saat sync, BUKAN di migration (lihat
+    wuzip-bot-architecture.txt bagian 7).
+FASE 4 - cart + kontak sync (BELUM ADA)
+  - cloudflare/shared/src/bot/cart/store.ts (tabel carts/cart_items sudah ada),
+    cloudflare/shared/src/bot/contacts/sync.ts (disebut di komentar policy.ts
+    sebagai pemilik refresh berkala no_ai; WuzapiClient.getContacts() sudah ada,
+    belum ada pemanggilnya).
+  - Tanpa sync: kontak yang di-rename menjadi "no_ai" tetap terdeteksi lewat
+    Info.PushName pada tiap pesan, tetapi tabel contacts tidak pernah terisi.
+FASE 5 - Turso + Sumopod + Telegram + outbox (BELUM ADA): lihat bagian 6.
+FASE 6 - nota PDF + rate limit + typing (BELUM ADA)
+  - cloudflare/shared/src/bot/nota/pdf.ts + sumber daya/HTML template.
+  - sendPresence("composing"/"paused") sudah ada di WuzapiClient dan BELUM
+    dipanggil; rate limit token bucket sudah berjalan (kapasitas 30, refill
+    0,5/detik) sehingga FASE 6 berarti penajaman (per-nomor, antrean, metrik),
+    bukan pembuatan dari nol.
+FASE 7 - cron/reconcile + DLQ lanjutan + observability (BELUM ADA)
+  - Handler scheduled() belum ada di cloudflare/shared/src/worker.ts (hanya ada
+    fetch() dan queue()), padahal CONTACT_SYNC_INTERVAL_MINUTES dan
+    RECONCILE_INTERVAL_MINUTES sudah dibaca config.
+  - Rekonsiliasi outbox + prune history (pruneHistory() sudah ada di history.ts,
+    belum ada pemanggilnya).
+  - Consumer DLQ dasar SUDAH ADA (consumer/dlq.ts); FASE 7 menambah metrik,
+    rekap harian, dan alert lanjutan.
+FASE 9 - voice (BELUM ADA)
+  - cloudflare/shared/src/bot/voice/transcribe.ts (unduh media audio, kirim ke
+    endpoint transkripsi, jadikan teks). VOICE_ENABLED sudah ada di config dan
+    wrangler.jsonc (default "false") tetapi belum cukup: tanpa transkripsi,
+    pesan audio tetap berakhir empty_body.
+FASE 8 tidak dirujuk oleh kode maupun brief ini; isi dan urutannya perlu
+dikonfirmasi sebelum dijadikan rencana.
+
+
+8. RINGKASAN SATU LAYAR
+-----------------------
+customer -> wuzapi (postmap) -> POST /ingest/<token> (token + HMAC + sha256
+deliveryId) -> Queue wuzapi-<nomor>-events -> consumer:
+  BOT_MODE=off    : relay ke DOWNSTREAM_URL
+  BOT_MODE=shadow : pipeline penuh, tidak ada yang dikirim ke customer
+  BOT_MODE=on     : pipeline penuh + balasan dikirim
+pipeline: filter -> policy -> lock DO -> claim D1 -> history -> responder
+          -> deliver (token bucket) -> settle (processed_events 'done' + lock
+          dilepas) -> ack; gagal sementara -> retry, gagal permanen -> ack/DLQ.

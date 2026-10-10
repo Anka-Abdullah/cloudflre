@@ -1,0 +1,12 @@
+packages:
+  - "shared"
+  - "[0-9]*"
+  # _template is scaffolding input, not a workspace package: it is copied and
+  # rewritten into cloudflare/<nomor>/ by scripts/new-instance.mjs.
+
+# esbuild and workerd ship their platform binaries as optional dependencies and
+# only validate them in postinstall; allowing the builds keeps `wrangler dev`
+# and vitest working on a clean checkout.
+allowBuilds:
+  esbuild: true
+  workerd: true

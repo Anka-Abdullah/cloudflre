@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@wuzip/wuzapi-queue-core": ["./shared/src/index.ts"]
+    }
+  },
+  "include": [
+    "shared/src/**/*.ts",
+    "shared/test/**/*.ts",
+    "shared/*.ts",
+    "*/src/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": ["node_modules", "_template", ".wrangler", ".pnpm-store"]
+}

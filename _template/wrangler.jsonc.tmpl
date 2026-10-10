@@ -1,0 +1,115 @@
+{
+  // One file per number: every name below is unique to this instance.
+  // `pnpm run provision -- --number <nomor>` fills in __D1_DATABASE_ID__ and
+  // __KV_NAMESPACE_ID__; everything else is already final.
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "__WORKER_NAME__",
+  "main": "src/index.ts",
+  "compatibility_date": "__COMPATIBILITY_DATE__",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "INSTANCE_SLUG": "__SLUG__",
+
+    // ---- ingress / relay --------------------------------------------------
+    // Payloads up to this size travel inline in the queue message; larger ones are
+    // streamed to R2 and replaced by a pointer (queue message limit: 128 KB).
+    "INLINE_MAX_BYTES": "90000",
+    // Cap for oversized bodies that arrive without Content-Length (R2 needs a
+    // known length to accept a stream).
+    "MEDIA_BUFFER_MAX_BYTES": "25000000",
+    // Per-field cap for the streaming JSON scan ("base64" is skipped, not capped).
+    "SCAN_MAX_FIELD_BYTES": "262144",
+
+    // strict: x-hmac-signature required and verified. optional: verified when
+    // present. off: token-only (not recommended).
+    "HMAC_MODE": "strict",
+    // r2: stream oversized payloads to the bucket below. reject: answer 413 and
+    // record the drop in the DLQ.
+    "MEDIA_MODE": "r2",
+    // relay: POST to DOWNSTREAM_URL (only used while BOT_MODE=off).
+    // observe: log and ack only, for wiring tests.
+    "RELAY_MODE": "relay",
+    "RETRY_BASE_SECONDS": "15",
+    "RETRY_MAX_SECONDS": "3600",
+    "DLQ_QUEUE_NAME": "__DLQ__",
+
+    // Bot endpoint that receives the envelopes while BOT_MODE=off. Empty while
+    // RELAY_MODE=observe.
+    "DOWNSTREAM_URL": "",
+    // Optional public base URL for the bucket, used to fill media.mediaUrl.
+    "R2_PUBLIC_BASE_URL": "",
+
+    // ---- automation -------------------------------------------------------
+    // off: relay only (rollback switch) · shadow: pipeline runs, nothing is sent
+    // to the customer · on: full bot.
+    "BOT_MODE": "off",
+    // Base URL of this number's wuzapi, no trailing slash. Must be reachable over
+    // public HTTPS; the worker calls /chat/send/* and /user/contacts on it.
+    "WUZAPI_API_BASE": "",
+    // OpenAI-compatible endpoint. The API key is a secret, never a var.
+    "AI_BASE_URL": "https://sejahteraselamanya.my.id/v1",
+    "AI_MODEL": "cmc/deepseek/deepseek-v4.1-flash",
+    "AI_TIMEOUT_MS": "60000",
+    "AI_MAX_TURNS": "3",
+    // auto → kv_inline while knowledge.txt fits KNOWLEDGE_INLINE_MAX_BYTES,
+    // otherwise r2_d1_fts (D1 FTS5 + bm25, verified available).
+    "KNOWLEDGE_MODE": "auto",
+    "KNOWLEDGE_INLINE_MAX_BYTES": "1048576",
+    "KNOWLEDGE_TOP_K": "5",
+    "KNOWLEDGE_HISTORY_LIMIT": "10",
+    // 0 disables the contact sync (and with it the periodic no_ai refresh).
+    "CONTACT_SYNC_INTERVAL_MINUTES": "10",
+    "PAYMENT_PROVIDER": "sumopod",
+    "PAYMENT_API_BASE": "https://api-pay-sandbox.sumopod.com",
+    "PAYMENT_EXPIRES_HOURS": "24",
+    // true: build the payment link and log it instead of calling the gateway.
+    "PAYMENT_DRY_RUN": "true",
+    "TELEGRAM_ENABLED": "false",
+    // Public base URL of this worker; used for the gateway callback URL.
+    "PUBLIC_BASE_URL": "",
+    "BOT_MAX_ITEMS": "20",
+    "BOT_MAX_ITEM_QTY": "99",
+    "OUTBOX_BATCH": "20",
+    "RECONCILE_INTERVAL_MINUTES": "1",
+    "VOICE_ENABLED": "false"
+  },
+  "queues": {
+    "producers": [
+      { "binding": "EVENTS", "queue": "__QUEUE__" },
+      { "binding": "DLQ", "queue": "__DLQ__" }
+    ],
+    "consumers": [
+      {
+        "queue": "__QUEUE__",
+        "max_batch_size": 20,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "retry_delay": 30,
+        "dead_letter_queue": "__DLQ__"
+      },
+      {
+        "queue": "__DLQ__",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3
+      }
+    ]
+  },
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "__BUCKET__" }],
+  "d1_databases": [
+    {
+      "binding": "BOT_DB",
+      "database_name": "__D1_NAME__",
+      "database_id": "__D1_DATABASE_ID__",
+      "migrations_dir": "../shared/src/bot/migrations"
+    }
+  ],
+  "kv_namespaces": [{ "binding": "KNOWLEDGE_KV", "id": "__KV_NAMESPACE_ID__" }],
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT_COORDINATOR", "class_name": "ChatCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatCoordinator"] }]
+}

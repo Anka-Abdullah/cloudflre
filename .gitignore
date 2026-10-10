@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+.pnpm-cache/
+.pnpm-state/
+.wrangler/
+dist/
+# Local secrets per number. Only the *.example files are committed.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+# wuzapi-local/.env is a copy of .env.example for local runs.
+wuzapi-local/.env
+# Docker CLI config copy used when $HOME is not writable (sandboxed runs).
+.docker/

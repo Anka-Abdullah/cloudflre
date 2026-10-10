@@ -1,0 +1,12 @@
+{
+  "name": "__PKG_NAME__",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@wuzip/wuzapi-queue-core": "workspace:*"
+  },
+  "wuzip": {
+    "_comment": "Read by scripts/provision.mjs. A KV namespace has no name field in wrangler.jsonc, only an id, so the title to create on first provision is recorded here. npm and wrangler both ignore this block.",
+    "kvNamespaceTitle": "__KV_NAME__"
+  }
+}
