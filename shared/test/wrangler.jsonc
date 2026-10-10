@@ -50,13 +50,22 @@
     "BOT_MAX_ITEMS": "20",
     "BOT_MAX_ITEM_QTY": "99",
     "OUTBOX_BATCH": "20",
+    // A claimed outbox row is owned for this long; a crashed flusher is retried after it.
+    "OUTBOX_LEASE_SECONDS": "120",
+    // After this many attempts a row is marked failed instead of retried forever.
+    "OUTBOX_MAX_ATTEMPTS": "6",
+    // 0 = off. When > 0, a chat whose last inbound message is older than this and
+    // was never answered gets one holding message (deduped per inbound message).
+    "RETRY_UNREPLIED_MINUTES": "0",
     "RECONCILE_INTERVAL_MINUTES": "1",
     "VOICE_ENABLED": "false",
 
     "WUZAPI_TOKEN": "test-wuzapi-token",
     "AI_API_KEY": "test-ai-key",
-    "TURSO_DATABASE_URL": "libsql://test.turso.io",
-    "TURSO_AUTH_TOKEN": "test-turso-token",
+    // Left empty on purpose: tests that need a database inject a SqlClient (the D1
+    // adapter). A fake URL here made cron jobs try to resolve it and time out.
+    "TURSO_DATABASE_URL": "",
+    "TURSO_AUTH_TOKEN": "",
     "PAYMENT_API_KEY": "test-payment-key",
     "PAYMENT_CALLBACK_SECRET": "test-payment-callback-secret",
     "TELEGRAM_BOT_TOKEN": "test-telegram-token",

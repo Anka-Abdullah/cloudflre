@@ -29,7 +29,7 @@
  */
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { parseNumberArg, randomToken, readWranglerConfig, runWrangler, stateDir } from "./lib.mjs";
+import { cloudflareRoot, parseNumberArg, randomToken, readWranglerConfig, runWrangler, stateDir } from "./lib.mjs";
 
 const CONFIG_PATH_FLAG = "--config";
 
@@ -104,7 +104,7 @@ function usage() {
   console.error("   deploy    : deploy this number's worker");
   console.error("   tail      : stream production logs");
   console.error("   migrate   : apply the D1 schema (--local to target the local database)");
-  console.error("   knowledge : upload prompt.txt / knowledge.txt to KV (or R2)");
+  console.error("   knowledge : upload prompt.txt / knowledge.txt (+ images, + D1 index rebuild)");
   console.error("   secrets   : set this number's secrets (--list, --from-env, --set NAME=VALUE, …)");
 }
 
@@ -186,6 +186,17 @@ async function main() {
     process.exit(1);
   }
 
+  // `pnpm run knowledge -- --help` must reach the sub-script, which knows its own
+  // flags; parsing a number first would answer with "--number is required".
+  if (command === "knowledge" && (rest.includes("--help") || rest.includes("-h"))) {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [join(cloudflareRoot, "scripts", "sync-knowledge.mjs"), "--help"], {
+      stdio: "inherit",
+    });
+    child.on("close", (code) => process.exit(code ?? 0));
+    return;
+  }
+
   const slug = parseNumberArg(rest);
   const { dir, config } = await readWranglerConfig(slug);
   const configPath = join(dir, "wrangler.jsonc");
@@ -243,9 +254,7 @@ async function main() {
   try {
     await access(script);
   } catch {
-    console.error("error: scripts/sync-knowledge.mjs is not present yet (phase 3 of the work plan adds it).");
-    console.error("       until then the knowledge can be uploaded manually:");
-    console.error("         wrangler kv key put --namespace-id <KNOWLEDGE_KV id> knowledge.txt --path <file> --remote");
+    console.error("error: scripts/sync-knowledge.mjs is missing from this checkout.");
     process.exit(1);
   }
   const { spawn } = await import("node:child_process");

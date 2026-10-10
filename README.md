@@ -84,7 +84,7 @@ cloudflare/
     └── README.md           # langkah dashboard untuk nomor ini
 ```
 
-Isi `shared/src/bot/` (FASE 2 yang sudah jadi):
+Isi `shared/src/bot/` dan sekitarnya (FASE 1-8, semua teruji):
 
 | File | Isi |
 |---|---|
@@ -95,11 +95,20 @@ Isi `shared/src/bot/` (FASE 2 yang sudah jadi):
 | `contacts/policy.ts` | aturan `no_ai` + `suppressed_chats` + saklar per chat |
 | `coordinator/chat-lock.ts` | Durable Object `ChatCoordinator`: lock per chat, seen-set, token bucket |
 | `wuzapi/client.ts` | klien REST wuzapi: sendText/sendImage/sendDocument/presence/getContacts + retry 1s/2s/4s |
-| `outbound.ts` | satu-satunya jalur kirim: hormati shadow mode, lewati token bucket |
-| `agent/run.ts` | seam responder (FASE 3 mengisi loop AI di sini) |
+| `outbound.ts` | satu-satunya jalur kirim: hormati shadow mode, token bucket, jeda manusiawi 1-3 detik |
+| `agent/run.ts` | loop AI: prompt + katalog + riwayat, native tool calling dengan fallback JSON |
+| `agent/tools.ts` | tool yang boleh dipanggil model (cart, gambar, `create_payment_link`) |
+| `knowledge/` | loader KV/R2, chunker, pencarian (in-memory + FTS5 bm25), parser katalog, sync index |
+| `sales/cart.service.ts` | keranjang D1; harga selalu dari katalog, bukan dari model |
+| `contacts/policy.ts`, `contacts/sync.ts` | aturan `no_ai` + sinkronisasi kontak dari wuzapi |
+| `payment/` | Turso (schema + repository idempoten), provider (dry-run/mock/Sumopod), checkout, settle, events, routes |
+| `telegram/` | klien Bot API, kartu approval, webhook admin, pending reply (`Ubah Biaya`) |
+| `outbox/store.ts`, `outbox/flush.ts` | antrean kirim: dedupe key, klaim lease, backoff, msgid deterministik |
+| `nota/pdf.ts` | nota PDF (`pdf-lib`) + fallback teks yang tidak mungkin gagal |
 | `queue/router.ts` | router batch: `wuzapi.event` / `payment.event` / `outbox.tick`, ack vs retry vs DLQ |
-| `queue/handlers.ts` | pipeline: filter → policy → lock → idempotensi → history → AI → kirim → settle |
-| `migrations/0001_init.sql` | skema D1 (messages, chat_state, processed_events, contacts, carts, outbox, …) |
+| `queue/handlers.ts` | pipeline: filter → policy → lock → idempotensi → history → AI → typing → kirim → settle |
+| `admin/routes.ts`, `cron.ts` | `/admin/*` dan semua job terjadwal (`scheduled()`) |
+| `migrations/0001_init.sql`, `0002_payment_outbox.sql` | skema D1: history, idempotensi, kontak, keranjang, outbox (+ dedupe/lease), `cron_state`, `telegram_pending` |
 
 Logika ada di `shared/` supaya satu perbaikan bug berlaku untuk semua nomor,
 sementara resource, secret, dan konfigurasi tetap terpisah per nomor.
@@ -204,8 +213,8 @@ Catatan:
 | `event` | satu webhook wuzapi, payload inline |
 | `media-pointer` | webhook yang sama tetapi payload terlalu besar; `event.payload` = `null` dan metadata pindah ke `media` |
 | `wuzapi.event` | alias eksplisit untuk dua di atas, supaya produsen luar bisa menyebut sumbernya |
-| `payment.event` | callback gateway/Telegram (FASE 5) |
-| `outbox.tick` | perintah "flush outbox sekarang" (FASE 5) |
+| `payment.event` | callback gateway / halaman dry-run / keputusan admin (satu-satunya penulis status order) |
+| `outbox.tick` | perintah "flush outbox sekarang" |
 
 `event` dan `media-pointer` dipertahankan sebagai nama kanonik karena itulah yang
 sudah dikirim `/ingest` dan dipakai semua deployment yang ada; router bot menerima
@@ -287,9 +296,33 @@ ter-escape tidak bisa dipindai tanpa buffering, sehingga pointer hanya membawa
 | `attempts` mencapai `max_retries` (default 5) | Cloudflare memindahkan pesan ke `wuzapi-<nomor>-dlq` |
 
 DLQ dikonsumsi worker yang sama: setiap record diarsipkan ke
-`_dlq/<nomor>/<tanggal>/<messageId>.json` di bucket R2 nomor tersebut, opsional
-mengirim notifikasi ke `ALERT_WEBHOOK_URL`, baru kemudian di-`ack`. Jika arsip
-gagal, pesan tetap di queue.
+`_dlq/<nomor>/<tanggal>/<messageId>.json` di bucket R2 nomor tersebut, lalu
+notifikasi dikirim ke `ALERT_WEBHOOK_URL` **dan/atau** ke chat admin lewat
+Telegram (`TELEGRAM_ENABLED=true`), baru kemudian di-`ack`. Jika arsip gagal,
+pesan tetap di queue.
+
+Dua kind envelope lain punya consumer sendiri (FASE 5-7):
+
+| Kind | Yang terjadi |
+|---|---|
+| `payment.event` | Satu-satunya penulis status order: nominal dicocokkan, transisi kondisional (`pending → paid`) dijalankan sekali, nota diantre ke outbox, konfirmasi dikirim ke customer. Callback ganda menjadi no-op. |
+| `outbox.tick` | Flush outbox sekarang (dipakai tes dan operator yang tidak mau menunggu cron). |
+
+### Outbox: satu-satunya jalur kirim yang boleh menunggu
+
+Pesan yang tidak boleh hilang (link pembayaran, nota, pemberitahuan penolakan)
+masuk ke tabel `outbox` D1 sebelum dikirim. Tiga mekanisme menjaga "sekali saja":
+
+| Mekanisme | Yang dicegah |
+|---|---|
+| `dedupe_key` UNIQUE | baris kedua untuk peristiwa bisnis yang sama (mis. `order:PAY-…:nota`) |
+| lease (`lease_id` + `claimed_until`, klaim lewat UPDATE kondisional) | dua flusher mengirim baris yang sama |
+| msgid deterministik `ob-<id>` | kiriman ulang setelah crash tampil dua kali di WhatsApp |
+
+Baris yang gagal sementara di-backoff (`RETRY_BASE_SECONDS`…`RETRY_MAX_SECONDS`)
+sampai `OUTBOX_MAX_ATTEMPTS`; 4xx dari wuzapi langsung ditandai `failed` dan
+alasannya tersimpan di kolom `last_error`. Flush dipicu tiga cara: cron tiap
+menit, envelope `outbox.tick`, dan `POST /admin/outbox/flush`.
 
 Sebelum bot siap: set `RELAY_MODE=observe` supaya event hanya dicatat dan di-ack.
 
@@ -313,10 +346,11 @@ Urutan pipeline untuk satu pesan masuk (lihat `shared/src/bot/queue/handlers.ts`
 4. idempotensi INSERT OR IGNORE ke processed_events; hanya status `done` yang memblokir
               pemrosesan ulang, sehingga retry setelah gagal tetap bisa jalan
 5. history    baca N pesan terakhir dari D1, lalu simpan pesan masuk
-6. AI         seam `agent/run.ts` (FASE 3 mengisi loop prompt + tool calling)
-7. outbound   deliverOutbound: shadow mode berhenti di sini; kalau tidak, ambil token
-              dari bucket per nomor lalu POST ke /chat/send/*
-8. settle     tandai `done`/`failed` dan lepaskan lock
+6. AI         loop prompt + tool calling (agent/run.ts): katalog, keranjang, tool
+7. typing     presence "composing" sebelum balasan, "paused" sesudahnya
+8. outbound   deliverOutbound: shadow mode berhenti di sini; kalau tidak, ambil token
+              dari bucket per nomor, jeda 1-3 detik antar pesan, lalu POST ke /chat/send/*
+9. settle     tandai `done`/`failed` dan lepaskan lock
 ```
 
 Mengapa urutannya begitu:
@@ -331,33 +365,115 @@ Mengapa urutannya begitu:
   token/detik ≈ 30 pesan/menit) melindungi nomor dari pembatasan WhatsApp.
 
 `GET /healthz` melaporkan `botMode`, `bindings` (EVENTS, DLQ, MEDIA, BOT_DB,
-KNOWLEDGE_KV, CHAT_COORDINATOR — boolean saja) dan `bot.ready` beserta
-`bot.missing` / `bot.missingBindings`. Tidak ada nilai secret yang pernah
-dikembalikan endpoint publik ini.
+KNOWLEDGE_KV, CHAT_COORDINATOR — boolean saja), `bot.ready` beserta
+`bot.missing` / `bot.missingBindings`, plus ringkasan `payment`, `telegram`,
+`outbox`, dan `cron` (semuanya boolean/angka: `tursoConfigured`, `dryRun`,
+`webhookSecretSet`, `batch`, interval). Tidak ada nilai secret yang pernah
+dikembalikan endpoint publik ini; `GET /admin/status` (Bearer `ADMIN_API_KEY`)
+memberi versi yang lebih lengkap, termasuk tabel Turso yang terlihat.
 
-### Mengunggah prompt & knowledge (sementara manual)
+### Mengunggah prompt & knowledge
 
-`scripts/sync-knowledge.mjs` belum ada, jadi `pnpm run knowledge` berhenti dengan
-pesan itu. Perintah manual ini sudah diverifikasi bekerja:
+Satu perintah, dari folder `cloudflare/`:
 
 ```sh
-# produksi
-wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
-  --remote "knowledge/prompt.txt"    --path <nomor>/knowledge/prompt.txt
-wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
-  --remote "knowledge/knowledge.txt" --path <nomor>/knowledge/knowledge.txt
-wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
-  --remote "knowledge/ongkir-policy.json" --path <nomor>/knowledge/ongkir-policy.json
+# dev lokal: tulis ke .wrangler/state yang dibaca `pnpm run dev`
+pnpm run knowledge -- --number <nomor> --local \
+  --prompt <nomor>/knowledge/prompt.txt --knowledge <nomor>/knowledge/knowledge.txt
 
-# dev lokal: tambahkan  --local --persist-to .wrangler/state
+# produksi (remote)
+export ADMIN_API_KEY=...            # untuk rebuild indeks D1 di worker
+pnpm run knowledge -- --number <nomor> \
+  --prompt <nomor>/knowledge/prompt.txt --knowledge <nomor>/knowledge/knowledge.txt
 ```
 
-**`--config <nomor>/wrangler.jsonc` wajib.** Tanpa itu wrangler membaca config
-di root `cloudflare/` (yang tidak ada), lalu gagal dengan pesan menyesatkan
-"No KV namespaces are configured in your wrangler config file".
+Perilaku `scripts/sync-knowledge.mjs`:
+
+| Hal | Detail |
+|---|---|
+| Target simpan | `KNOWLEDGE_MODE=auto` → KV selama ≤ `KNOWLEDGE_INLINE_MAX_BYTES`, di atas itu R2 (sama dengan aturan loader) |
+| Gambar | Folder `--images <dir>` (default `<nomor>/knowledge/images/`) selalu ke R2 dengan kunci `knowledge/images/<nama>` |
+| Ongkir | `<nomor>/knowledge/ongkir-policy.json` ikut diunggah bila ada |
+| Verifikasi | Setiap objek dibaca ulang dan dibandingkan sha256-nya; `--no-verify` untuk melewati |
+| Indeks D1 | `POST /admin/knowledge/sync` (butuh worker berjalan + `ADMIN_API_KEY`) mengisi `knowledge_chunks`, FTS5, dan `catalog_products` |
+| Tanpa worker | `--skip-index` (atau `--url` kosong) mengunggah berkas saja; indeks bisa disusun nanti |
+
+`--dry-run` mencetak rencana tanpa mengunggah apa pun, dan `--help` mencetak
+seluruh flag. **`--config <nomor>/wrangler.jsonc` dipakai otomatis oleh wrapper
+`pnpm run knowledge`** — memanggil `wrangler` langsung tanpa flag itu akan gagal
+dengan pesan menyesatkan "No KV namespaces are configured".
 
 Ukuran nyata: `prompt.txt` 16 KB + `knowledge.txt` 57 KB = ~73 KB, aman di KV;
-gambar (70 berkas, 4,7 MB) ke R2 dengan kunci `knowledge/images/<nama>`.
+gambar (70 berkas, 4,7 MB) ke R2.
+
+### Order, pembayaran, dan nota (FASE 4-6)
+
+Alur lengkapnya, semua tanpa nomor WA:
+
+```
+keranjang (D1)  ->  create_payment_link (tool)
+                      |
+                      |  harga SELALU dibaca ulang dari katalog, client_ref =
+                      |  hash(chat + isi keranjang + nama + alamat)  -> idempoten
+                      v
+                  order di Turso (status creating)
+                      |
+      ongkir termasuk? +--> ya  -> approved -> tautan pembayaran -> pending
+                      |                        (PAYMENT_DRY_RUN=true:
+                      |                         {PUBLIC_BASE_URL}/dry-run/<kode_bayar>)
+                      +--> tidak -> awaiting_approval -> kartu Telegram ke admin
+                                     (Terima / Tolak / Ubah Biaya)
+                      |
+   customer bayar ---+-> payment.event -> consumer: nominal dicek, pending -> paid,
+                          nota PDF dirender, masuk outbox, konfirmasi dikirim
+```
+
+Yang bisa dijalankan sekarang, tanpa Sumopod dan tanpa WhatsApp:
+
+| Perintah | Kegunaan |
+|---|---|
+| `pnpm run smoke:turso -- --number <nomor>` | schema + CRUD + idempotensi ke Turso asli; tanpa kredensial ia menguji SQLite lokal |
+| `GET /dry-run/<kode_bayar>` | halaman simulasi pembayaran (hanya saat `PAYMENT_DRY_RUN=true`); tombolnya mengirim `payment.event` yang sama seperti callback gateway |
+| `POST /admin/orders/<kode>/approve` | jalur approval tanpa Telegram: `{"additionalFee": 25000, "reason": "…"}` |
+| `POST /admin/orders/<kode>/reject` | tolak + alasan yang dikirim ke customer lewat outbox |
+| `POST /admin/outbox/flush` | kirim isi outbox sekarang |
+| `GET /admin/status` | ringkasan Turso/Telegram/outbox untuk operator |
+
+Nominal tidak pernah datang dari teks customer maupun dari model: `order_items.harga`
+disalin dari katalog D1 (`catalog_products`), dan callback dengan nominal berbeda
+tidak mengubah status apa pun (hanya dicatat + dieskalasi ke log admin).
+
+### Cron (FASE 7)
+
+Setiap nomor punya trigger `*/1 * * * *` (`triggers.crons` di `wrangler.jsonc`).
+`shared/src/cron.ts` menjalankan:
+
+| Job | Kapan | Isi |
+|---|---|---|
+| `outbox_flush` | tiap menit | klaim lease + kirim + tandai (`sent`/`failed`, backoff) |
+| `expire_orders` | tiap menit | order lewat `expires_at` → `expired` + satu pesan ke customer |
+| `reconcile_payments` | tiap menit | tanya status ke gateway (`PAYMENT_DRY_RUN=false`) lalu **antre** `payment.event` — bukan mengubah order langsung |
+| `contact_sync` | `CONTACT_SYNC_INTERVAL_MINUTES` | `GET /user/contacts` → `contacts` + saklar `no_ai` |
+| `retry_unreplied` | `RETRY_UNREPLIED_MINUTES` (0 = mati) | chat yang belum dibalas → satu pesan menahan (dedupe per pesan masuk) |
+| `prune_history` | harian | history 90 hari + kartu Telegram 72 jam |
+
+Job interval diklaim lewat tabel `cron_state` (UPDATE kondisional), jadi dua
+invokasi cron yang tumpang tindih tidak menjalankan job yang sama dua kali, dan
+satu job yang gagal tidak membatalkan job lain.
+
+### E2E tanpa nomor WA (FASE 8)
+
+```sh
+pnpm run e2e -- --number <nomor>      # 33 pemeriksaan, ~1 menit
+E2E_VERBOSE=1 pnpm run e2e -- --number <nomor>
+```
+
+Yang dijalankan: `wrangler dev` asli (queue, D1, KV, R2, DO nyata) + tiga tiruan
+(`pnpm run mock:services`: wuzapi, Telegram, AI) + `pnpm run mock:turso` (server
+libSQL/hrana di atas SQLite lokal). Yang dibuktikan: balasan 1:1 terkirim sekali,
+duplikat tidak menggandakan balasan, `no_ai` tidak dibalas, checkout otomatis,
+checkout lewat kartu admin (termasuk tombol Terima + kartu yang diedit), halaman
+dry-run, nota PDF terkirim sebagai dokumen, dan order berakhir `paid`.
 
 ### Catatan katalog (dari referensi `automation_chat`)
 
@@ -398,10 +514,10 @@ di dalam repo.**
 | `ALERT_WEBHOOK_URL` | notifikasi DLQ | opsional |
 | `WUZAPI_TOKEN` | header `Token` untuk `/chat/send/*` dan `/user/contacts` | `shadow`/`on` |
 | `AI_API_KEY` | endpoint AI OpenAI-compatible | `shadow`/`on` |
-| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | order/payment (FASE 5) | FASE 5 |
-| `PAYMENT_API_KEY`, `PAYMENT_CALLBACK_SECRET` | gateway Sumopod (FASE 5) | FASE 5 |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET` | kartu approval admin (FASE 5) | FASE 5 |
-| `ADMIN_API_KEY` | `/admin/*` (FASE 3/4) | FASE 3 |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | order/payment (Turso, HTTP libsql) | checkout (`create_payment_link`) |
+| `PAYMENT_API_KEY`, `PAYMENT_CALLBACK_SECRET` | gateway Sumopod | sebelum `PAYMENT_DRY_RUN=false`; callback ditolak bila secret kosong |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET` | kartu approval admin | saat `TELEGRAM_ENABLED=true` |
+| `ADMIN_API_KEY` | `/admin/*` | selalu (tanpa itu endpoint admin menjawab 503) |
 
 `vars` yang paling sering diubah: `BOT_MODE`, `WUZAPI_API_BASE`, `AI_BASE_URL`,
 `AI_MODEL`, `KNOWLEDGE_MODE`, `KNOWLEDGE_TOP_K`, `KNOWLEDGE_HISTORY_LIMIT`,
@@ -451,10 +567,12 @@ bisa disimpan per nomor di sisi bot.
 ```sh
 cd cloudflare
 pnpm install
-pnpm test                     # 160 uji di runtime Workers: HMAC vs fixture Go, scanner,
+pnpm test                     # 471 uji di runtime Workers: HMAC vs fixture Go, scanner,
                               # ingest (R2 asli), consumer, skema+constraint D1 & FTS5,
                               # filter/ekstraksi teks, idempotensi, policy no_ai,
-                              # Durable Object lock + token bucket, pipeline bot end-to-end
+                              # Durable Object lock + token bucket, pipeline bot end-to-end,
+                              # Turso (DDL + repository idempoten lewat SQLite asli),
+                              # checkout/approval/payment/outbox, nota PDF, Telegram, cron, DLQ
 pnpm typecheck
 
 # 0) smoke test endpoint AI (butuh AI_API_KEY; tidak menulis apa pun ke disk)
@@ -469,7 +587,18 @@ pnpm run simulate -- \
   --key dev-hmac-key-0123456789abcdef --format json
 #   --format form | media --media-bytes 150000
 
-# 3) opsional: wuzapi sungguhan (SQLite, tanpa postgres/rabbitmq)
+# 3) E2E lengkap tanpa nomor WA (mock wuzapi + Telegram + AI + Turso)
+pnpm run e2e -- --number 6281234567890
+E2E_VERBOSE=1 pnpm run e2e -- --number 6281234567890   # lihat log worker & mock
+
+# 4) tiruan pihak ketiga, bila ingin dipakai manual (wrangler dev terpisah)
+pnpm run mock:services -- --port 8898     # wuzapi + Telegram + AI
+pnpm run mock:turso    -- --port 8899     # libSQL/hrana di atas SQLite lokal
+#    lalu di .dev.vars: WUZAPI_API_BASE=http://127.0.0.1:8898/wuzapi,
+#    AI_BASE_URL=http://127.0.0.1:8898/ai/v1, TELEGRAM_API_BASE=http://127.0.0.1:8898/telegram,
+#    TURSO_DATABASE_URL=http://127.0.0.1:8899
+
+# 5) opsional: wuzapi sungguhan (SQLite, tanpa postgres/rabbitmq)
 cd wuzapi-local && cp .env.example .env && docker compose up -d --build
 #   dashboard: http://localhost:8081/dashboard (token dari .env)
 #   lalu langganan event + connect; detail langkahnya di wuzapi-local/README.md
@@ -507,7 +636,7 @@ cd cloudflare/tools/hmac-fixture && go run . ../../shared/test/fixtures/wuzapi-h
 | `pnpm run deploy -- --number <nomor>` | deploy worker nomor itu |
 | `pnpm run tail -- --number <nomor>` | stream log produksi |
 | `pnpm run smoke:ai [-- --number <nomor>]` | uji endpoint AI: teks, native tool calling, JSON mode |
-| `pnpm run knowledge -- --number <nomor>` | unggah prompt/knowledge — **belum ada skripnya**; lihat perintah manual di bagian 8 |
+| `pnpm run knowledge -- --number <nomor> --prompt <file> --knowledge <file>` | unggah prompt/knowledge (+ gambar, + indeks D1); lihat bagian 8 |
 | `pnpm run simulate -- --url … --key …` | kirim satu webhook bertanda tangan |
 
 Rotasi HMAC tanpa downtime: `WUZAPI_HMAC_KEYS` menerima beberapa key dipisah
@@ -553,7 +682,14 @@ retry, DLQ) tersedia di dashboard Cloudflare.
 | `D1_ERROR: no such table` | `pnpm run migrate -- --number <nomor>` belum dijalankan, atau `database_id` di `wrangler.jsonc` masih placeholder (jalankan `pnpm run provision`). |
 | `event_locked` berulang terus | Ada pemrosesan yang tidak pernah selesai (biasanya AI menggantung). Kurangi `AI_TIMEOUT_MS`, pastikan `AI_MAX_TURNS` kecil; lock kedaluwarsa sendiri setelah 120 detik. |
 | `rate_limited` sering | Nomor mengirim terlalu cepat. Bucket sengaja dibatasi 30 pesan burst dan 30/menit; kalau perlu, turunkan volume balasan per pesan. |
-| `ai_unavailable` + balasan generik | Responder AI belum ada (FASE 3) atau `AI_API_KEY`/`AI_BASE_URL` kosong. Ini fallback yang disengaja supaya customer tetap dapat jawaban. |
+| `ai_unavailable` + balasan generik | `AI_API_KEY`/`AI_BASE_URL`/`AI_MODEL` kosong (atau `AI_MAX_TOKENS` 0). Ini fallback yang disengaja supaya customer tetap dapat jawaban. |
+| `create_payment_link` menjawab "gagal (turso_not_configured)" | `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` belum diisi. Set keduanya, lalu `pnpm run smoke:turso -- --number <nomor> --local-secrets`. |
+| Kartu approval tidak muncul di Telegram | `TELEGRAM_ENABLED=false`, token/chat kosong, atau admin belum menekan `/start`. Balasan `/start` memuat `TELEGRAM_CHAT_ID=<id>`. Alternatif tanpa Telegram: `POST /admin/orders/<kode>/approve`. |
+| Webhook Telegram menjawab `401` | `X-Telegram-Bot-Api-Secret-Token` ≠ `TELEGRAM_WEBHOOK_SECRET`, atau secret kosong (worker sengaja menolak semuanya). Daftarkan ulang webhook dengan `secret_token` yang sama. |
+| Order tidak pernah jadi `paid` | Cek `GET /admin/status` (`payment.tursoConfigured`, `payment.dryRun`, tabel Turso), lalu `payment_event`/`payment_settle_failed` di log. Saat `PAYMENT_DRY_RUN=true` hanya halaman `/dry-run/<kode_bayar>` yang bisa membayar. |
+| Nota tidak terkirim | Nota lewat outbox: `POST /admin/outbox/flush`, lalu periksa kolom `last_error`/`attempts`/`status` di tabel `outbox`. `wuzapi` yang menolak 4xx membuat baris ditandai `failed` (tidak diulang selamanya). |
+| `reconcile_query_failed` tiap menit | `PAYMENT_API_BASE`/`PAYMENT_STATUS_PATH` belum cocok dengan API gateway. Rekonsiliasi dilewati saat `PAYMENT_DRY_RUN=true`. |
+| Link pembayaran menunjuk URL relatif | `PUBLIC_BASE_URL` kosong. Isi dengan URL worker nomor ini, mis. `https://wuzapi-<nomor>.<subdomain>.workers.dev`. |
 | `bot_degraded_shadow` | `BOT_MODE=on` tetapi konfigurasi belum lengkap (lihat `missing`/`missingBindings` di log). Worker sengaja diam, bukan mengirim balasan generik ke customer. Lengkapi secret lalu periksa `GET /healthz`. |
 | Biaya AI membengkak | Turunkan `KNOWLEDGE_TOP_K` dan `KNOWLEDGE_HISTORY_LIMIT`; pastikan filter grup/status tetap aktif (mereka menolak sebelum panggilan AI). |
 

@@ -27,6 +27,13 @@ export const RATE_REFILL_PER_SECOND = 0.5;
 /** How long a single send waits for a token before giving up to the caller. */
 const RATE_WAIT_ATTEMPTS = 3;
 const RATE_WAIT_MAX_MS = 5_000;
+/**
+ * Gap between two messages of the same reply. A customer who receives four
+ * bubbles in 40 ms is talking to a machine; 1–3 s is what a human assistant
+ * looks like, and it also keeps the number away from WhatsApp's burst heuristics.
+ */
+export const HUMAN_DELAY_MIN_MS = 1_000;
+export const HUMAN_DELAY_MAX_MS = 3_000;
 
 export interface SendFailure {
   message: OutboundMessage;
@@ -51,6 +58,8 @@ export interface OutboundContext {
   /** False in shadow mode and in tests that assert no traffic. */
   deliver: boolean;
   sleep?: (ms: number) => Promise<void>;
+  /** Test seam for the human-like gap between messages. */
+  random?: () => number;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -143,9 +152,18 @@ export async function deliverOutbound(
   }
 
   const failures: SendFailure[] = [];
+  const random = context.random ?? Math.random;
   let sent = 0;
+  let handled = 0;
 
   for (const message of messages) {
+    // Human-like gap between the parts of one reply (never before the first).
+    if (handled > 0) {
+      const gap = HUMAN_DELAY_MIN_MS + Math.trunc(random() * (HUMAN_DELAY_MAX_MS - HUMAN_DELAY_MIN_MS));
+      await sleep(gap);
+    }
+    handled += 1;
+
     if (!(await takeRateToken(context, sleep))) {
       failures.push({ message, error: "rate limited", attempts: 0, permanent: false });
       continue;

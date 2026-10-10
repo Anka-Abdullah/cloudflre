@@ -102,11 +102,19 @@ export async function resolveChatPolicy(
 /**
  * Writes one synced contact and the bot switch it implies. Returns whether the
  * switch changed, so the sync can log only real transitions.
+ *
+ * `no_ai` is treated as a *transition*, not a level: `bot_enabled` is only
+ * rewritten when the contact is seen for the first time, when the marker appears
+ * or disappears, or when the chat carries a manual `suppressed_chats` row.
+ * Writing the level on every pass would quietly undo an admin's deliberate
+ * "bot off" (`bot_disabled` in `resolveChatPolicy`) every
+ * CONTACT_SYNC_INTERVAL_MINUTES — while a suppression, which is an explicit
+ * opt-out, is re-asserted on every sync so a rename can never revive it.
  */
 export async function upsertContact(
   db: D1Database,
   input: { chatJid: string; contact: JsonRecord; at: number },
-): Promise<{ hasNoAi: boolean; botEnabled: boolean; changed: boolean }> {
+): Promise<{ hasNoAi: boolean; botEnabled: boolean; changed: boolean; firstSeen: boolean }> {
   const names = namesFromContact(input.contact);
   const hasNoAi = noAiFromContact(input.contact);
   const previous = await db
@@ -137,24 +145,42 @@ export async function upsertContact(
     )
     .run();
 
-  // The contact name is the source of truth for the no_ai convention, so the
-  // per-chat switch follows it: rename to `no_ai` turns the bot off, removing it
-  // turns the bot back on — unless an admin suppressed the chat outright.
+  const previousNoAi = previous ? previous.has_no_ai === 1 : null;
+  const changed = previousNoAi !== hasNoAi;
+
   const suppressed = await db
     .prepare("SELECT chat_jid FROM suppressed_chats WHERE chat_jid = ?")
     .bind(input.chatJid)
     .first<{ chat_jid: string }>();
-  const botEnabled = !hasNoAi && !suppressed;
 
-  await db
-    .prepare(
-      `INSERT INTO chat_state (chat_jid, bot_enabled, lock_until, last_inbound_at, last_outbound_at, updated_at)
-       VALUES (?, ?, 0, NULL, NULL, ?)
-       ON CONFLICT (chat_jid) DO UPDATE SET bot_enabled = excluded.bot_enabled, updated_at = excluded.updated_at`,
-    )
-    .bind(input.chatJid, botEnabled ? 1 : 0, input.at)
-    .run();
+  const state = await db
+    .prepare("SELECT bot_enabled FROM chat_state WHERE chat_jid = ?")
+    .bind(input.chatJid)
+    .first<{ bot_enabled: number }>();
 
-  const previousNoAi = previous ? previous.has_no_ai === 1 : null;
-  return { hasNoAi, botEnabled, changed: previousNoAi !== hasNoAi };
+  // Three cases, in this order:
+  //   1. a manual suppression wins and is re-asserted on every sync, so a
+  //      suppressed chat can never be switched back on by a rename;
+  //   2. the marker appeared/disappeared (or this is the first sync) → follow it;
+  //   3. nothing about the contact changed → leave `bot_enabled` alone, because
+  //      the most likely reason it differs is an admin's deliberate switch.
+  const botEnabled = suppressed
+    ? false
+    : changed || !state
+      ? !hasNoAi
+      : state.bot_enabled === 1;
+  const write = suppressed !== null || changed || !state;
+
+  if (write) {
+    await db
+      .prepare(
+        `INSERT INTO chat_state (chat_jid, bot_enabled, lock_until, last_inbound_at, last_outbound_at, updated_at)
+         VALUES (?, ?, 0, NULL, NULL, ?)
+         ON CONFLICT (chat_jid) DO UPDATE SET bot_enabled = excluded.bot_enabled, updated_at = excluded.updated_at`,
+      )
+      .bind(input.chatJid, botEnabled ? 1 : 0, input.at)
+      .run();
+  }
+
+  return { hasNoAi, botEnabled, changed, firstSeen: previous === null };
 }

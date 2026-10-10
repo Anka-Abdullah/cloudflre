@@ -6,8 +6,10 @@ Pasangan      : wuzip-bot-architecture.txt (kontrak queue, skema, env & secret)
                 wuzip-bot-runbook.txt       (operasi harian, troubleshooting)
 Path          : semua path di dokumen ini relatif terhadap root repo
                 /Users/ank/project/wuzip-bot
-Status        : FASE 0-2 SUDAH ADA kodenya. FASE 3-9 BELUM ADA; setiap bagian
-                yang belum ada ditandai "RENCANA (FASE n)".
+Status        : FASE 0-8 SUDAH ADA kodenya dan terverifikasi (471 uji + 33
+                pemeriksaan E2E). Yang belum: FASE 9 (voice) dan semua yang
+                butuh kredensial/pairing (WUZAPI_API_BASE/TOKEN nomor asli,
+                pairing, kunci Sumopod live).
 Aturan        : tidak ada nilai secret di dokumen ini, hanya nama variabel.
 
 
@@ -21,27 +23,30 @@ Aturan        : tidak ada nilai secret di dokumen ini, hanya nama variabel.
 | 1    | ingest /ingest/<token> + HMAC + R2 + relay +     | ADA                       |
 |      | consumer DLQ                                     | shared/src/ingest/*,      |
 |      |                                                  | shared/src/consumer/*     |
-| 2    | pipeline bot tanpa AI: filter, policy no_ai,     | ADA                       |
-|      | lock Durable Object, idempotensi D1, history,    | shared/src/bot/**         |
-|      | outbound + token bucket, BOT_MODE off/shadow/on  |                           |
-| 3    | knowledge (prompt.txt/knowledge.txt) + AI agent  | BELUM ADA - RENCANA       |
-| 4    | cart + kontak sync (no_ai periodik)              | BELUM ADA - RENCANA       |
-| 5    | Turso + Sumopod + Telegram + outbox flush        | BELUM ADA - RENCANA       |
-| 6    | nota PDF + rate limit lanjutan + typing          | BELUM ADA - RENCANA       |
-| 7    | cron/reconcile + DLQ lanjutan + observability    | BELUM ADA - RENCANA (1)   |
-| 8    | tidak dirujuk kode maupun brief ini              | PERLU KONFIRMASI          |
+| 2    | pipeline bot: filter, policy no_ai, lock DO,     | ADA                       |
+|      | idempotensi D1, history, outbound + bucket,      | shared/src/bot/**         |
+|      | BOT_MODE off/shadow/on                           |                           |
+| 3    | knowledge + AI agent (native tool calling)       | ADA                       |
+|      |                                                  | knowledge/*, agent/*      |
+| 4    | cart + kontak sync (no_ai periodik)              | ADA                       |
+|      |                                                  | sales/*, contacts/*       |
+| 5    | Turso + Telegram + Sumopod (dry-run) + outbox    | ADA (a: Turso, b: alur)   |
+| 6    | nota PDF + rate limit + typing                   | ADA                       |
+| 7    | cron/reconcile + DLQ alert + observability       | ADA                       |
+| 8    | E2E mock wuzapi/AI/Turso + dokumentasi           | ADA                       |
 | 9    | voice note (transkripsi audio)                   | BELUM ADA - RENCANA       |
 +------+--------------------------------------------------+---------------------------+
-(1) Consumer DLQ dasar SUDAH ADA di cloudflare/shared/src/consumer/dlq.ts (arsip ke
-    R2 + alert). Yang belum ada di FASE 7 adalah cron/scheduled handler dan
-    observability lanjutan (metrik, rekonsiliasi). Lihat bagian 6.
+| sisa | kredensial + pairing nomor asli + Sumopod live   | MENUNGGU OPERATOR         |
++------+--------------------------------------------------+---------------------------+
+Yang masih menunggu dan TIDAK bisa dikerjakan tanpa kredensial/pairing:
+WUZAPI_API_BASE + WUZAPI_TOKEN nomor asli, pairing nomor pertama, PAYMENT_API_KEY +
+PAYMENT_CALLBACK_SECRET Sumopod (live), uji shadow -> on di nomor asli, rotasi
+token Turso + Telegram.
 
-Yang benar-benar sudah berjalan hari ini pada BOT_MODE=shadow|on: filter, policy,
-lock, idempotensi, history, dan pengiriman balasan. Balasan yang dikirim BUKAN
-jawaban AI: cloudflare/shared/src/bot/agent/run.ts mengembalikan fallbackReply()
-deterministik dan mencatat log "ai_unavailable" (reason "responder_is_fallback")
-pada setiap pesan; FASE 3 menggantinya dengan prompt + tool calling tanpa
-mengubah kontrak Responder/ReplyPlan.
+Bukti otomatis: 471 uji vitest (23 berkas) + `pnpm run e2e -- --number <nomor>`
+(33 pemeriksaan: balasan 1:1, duplikat, no_ai, checkout otomatis, checkout lewat
+kartu admin, halaman dry-run, nota PDF, order paid) - semuanya di wrangler dev
+dengan mock wuzapi/Telegram/AI dan mock Turso di atas SQLite, tanpa nomor WA.
 
 
 1. ALUR A - CUSTOMER SAMPAI KE QUEUE (SUDAH ADA)
@@ -191,7 +196,7 @@ Urutan ringkas (persis seperti komentar modul shared/src/bot/queue/handlers.ts):
  17. responder(context) -> ReplyPlan {messages, reason}:
        - hari ini: fallbackReply() deterministik (log "ai_unavailable",
          reason "fallback_reply"); tidak pernah menyebut harga/stok.
-       - RENCANA (FASE 3): loop prompt + tool calling di
+       - ADA (FASE 3): loop prompt + tool calling di
          cloudflare/shared/src/bot/agent/prompt.ts, agent/llm.ts, dan
          agent/tools.ts (disebut di komentar modul agent/run.ts); kontrak
          Responder/ReplyPlan tidak berubah sehingga downstream tidak ikut
@@ -296,8 +301,8 @@ MENGAPA URUTANNYA BEGITU
 | kirim gagal, ada yang non-permanent      | retry    | outbound_incomplete, 15 s     |
 | exception di handler                     | retry    | event_failed, 30 s            |
 | sukses                                   | ack      | event_done                    |
-| payment.event (FASE 5 belum ada)         | ack      | payment_event_phase5          |
-| outbox.tick (FASE 5 belum ada)           | ack      | outbox_tick_phase5            |
+| payment.event (FASE 5b)                  | ack      | paid/expired/failed/duplicate |
+| outbox.tick (FASE 5b)                    | ack      | flushed:<jumlah terkirim>     |
 | handler payment/outbox melempar          | retry    | bot_handler_crashed, 30 s     |
 | attempts mencapai max_retries (5)        | DLQ      | dipindahkan Cloudflare        |
 +------------------------------------------+----------+-------------------------------+
@@ -371,13 +376,30 @@ Semua penolakan hanya menjadi log "event_filtered" (atau "event_suppressed")
 dan pesan queue di-ack; tidak ada balasan yang dikirim ke customer.
 
 
-6. ALUR CHECKOUT / PAYMENT - RENCANA (FASE 5), BELUM ADA KODENYA
+6. ALUR CHECKOUT / PAYMENT - SUDAH ADA (FASE 5a/5b/6)
 ----------------------------------------------------------------
-Tidak ada satu pun baris kode checkout/payment di repo ini per akhir sesi.
-Yang SUDAH ADA dan bisa dipakai FASE 5:
+Nomor langkah di bawah ini adalah rencana awal; yang benar-benar dijalankan ada
+di shared/src/bot/payment/checkout.ts + settle.ts, dan diuji oleh
+shared/test/payment-flow.test.ts, payment-routes.test.ts, payment-turso.test.ts,
+cron.test.ts, serta skenario checkout di scripts/e2e-bot.mjs.
+
+Perbedaan yang perlu diketahui (implementasi vs rencana):
+  - "membuat order dengan status creating" dilakukan lewat INSERT OR IGNORE pada
+    client_ref = hash(chat + isi keranjang + nama + alamat), jadi panggilan kedua
+    MENYAMBUNG order yang sama, bukan membuat yang baru;
+  - order lama untuk chat yang sama ditandai superseded + superseded_by begitu
+    isi keranjang berubah;
+  - satu baris payments per order, dibuat saat kartu approval dikirim (agar
+    message_id kartu bisa disimpan) dan dipakai ulang saat tautan dibuat;
+  - semua pesan ke customer (link, penolakan, kedaluwarsa, nota) lewat outbox
+    dengan dedupe_key, sehingga tidak mungkin terkirim dua kali;
+  - rekonsiliasi cron TIDAK mengubah order: ia mengantre payment.event, sama
+    seperti callback gateway.
+
+Yang sudah ada sejak dulu dan dipakai FASE 5:
   - skema D1: tabel carts, cart_items, catalog_products, outbox
-    (cloudflare/shared/src/bot/migrations/0001_init.sql) - belum ada kode yang
-    menulis/membacanya;
+    (cloudflare/shared/src/bot/migrations/0001_init.sql) - ditulis/dibaca oleh
+    sales/cart.service.ts, outbox/*, dan admin/routes.ts;
   - konfigurasi: PAYMENT_PROVIDER=sumopod, PAYMENT_API_BASE,
     PAYMENT_EXPIRES_HOURS, PAYMENT_DRY_RUN, PUBLIC_BASE_URL, BOT_MAX_ITEMS,
     BOT_MAX_ITEM_QTY, OUTBOX_BATCH, RECONCILE_INTERVAL_MINUTES, TELEGRAM_ENABLED
@@ -390,7 +412,8 @@ Yang SUDAH ADA dan bisa dipakai FASE 5:
   - WuzapiClient.sendPresence("composing"|"paused") sudah ada tetapi belum
     dipanggil dari mana pun.
 
-Rencana langkah (semua langkah bertanda * belum ada kodenya):
+Rencana langkah (implementasinya ada di payment/checkout.ts + settle.ts; tanda *
+menandai langkah yang dulu direncanakan, bukan status sekarang):
 
   1. * Customer menyusun cart di D1 (FASE 4): carts + cart_items; harga SELALU
        dibaca ulang dari catalog_products saat menulis, tidak pernah dari teks
@@ -412,8 +435,8 @@ Rencana langkah (semua langkah bertanda * belum ada kodenya):
        PAYMENT_EXPIRES_HOURS (default 24 jam).
   8. * Gateway memanggil balik worker (callback ditandatangani
        PAYMENT_CALLBACK_SECRET). Callback diverifikasi, lalu satu envelope
-       kind="payment.event" dikirim ke queue EVENTS (belum ada route-nya di
-       worker.ts). Handler FASE 5 (saat ini ack) akan memprosesnya.
+       kind="payment.event" dikirim ke queue EVENTS oleh POST /payment/callback
+       atau halaman /dry-run/<kode_bayar>. Consumer memprosesnya (settle.ts).
   9. * Callback valid + nominal cocok -> status "paid". Nominal tidak cocok atau
        signature salah -> tidak ada perubahan status, dicatat, dan (bila perlu)
        eskalasi ke admin.
@@ -445,7 +468,7 @@ Transisi yang diizinkan: creating -> awaiting_approval -> approved|rejected;
 approved -> pending; pending -> paid|expired|failed; awaiting_approval|pending ->
 superseded. Transisi lain harus ditolak handler, bukan "diperbaiki" diam-diam.
 
-File yang akan dibuat di FASE 5 (usulan nama, belum ada):
+File FASE 5 yang akhirnya dibuat (nama nyata di repo):
   cloudflare/shared/src/bot/cart/store.ts        (FASE 4, dipakai di sini)
   cloudflare/shared/src/lib/turso.ts             klien HTTP libsql
   cloudflare/shared/src/bot/orders/store.ts      orders + order_items
@@ -456,52 +479,59 @@ File yang akan dibuat di FASE 5 (usulan nama, belum ada):
                                                  /telegram/webhook, /admin/*)
 
 
-7. RINGKASAN FASE 3-9: YANG BELUM ADA KODENYA + FILE YANG AKAN DIBUAT
+7. RINGKASAN FASE 3-9: STATUS BERKAS (FASE 3-8 SELESAI)
 ---------------------------------------------------------------------
-FASE 3 - knowledge + AI agent (BELUM ADA)
-  - Script sync knowledge: cloudflare/scripts/sync-knowledge.mjs. Perintah
-    "pnpm run knowledge" sudah ada di scripts/instance.mjs tetapi sengaja gagal
-    dengan pesan "scripts/sync-knowledge.mjs is not present yet (phase 3)".
-  - Sumber: prompt.txt (system prompt) dan knowledge.txt (Produk:/Harga:/Ongkir:)
-    di cloudflare/<nomor>/.
-  - Modul (usulan nama, belum ada): cloudflare/shared/src/bot/knowledge/sync.ts
-    (isi KV/R2 + isi knowledge_chunks/catalog_products),
-    cloudflare/shared/src/bot/knowledge/search.ts (FTS5 + bm25 atau kv_inline),
-    cloudflare/shared/src/bot/agent/prompt.ts (system prompt + aturan harga),
-    cloudflare/shared/src/bot/agent/llm.ts (loop prompt + tool calling,
-    menggantikan fallbackReply), cloudflare/shared/src/bot/agent/tools.ts
-    (get_price, cek stok, buat cart).
-  - Indeks FTS5 dibuat lazy saat sync, BUKAN di migration (lihat
-    wuzip-bot-architecture.txt bagian 7).
-FASE 4 - cart + kontak sync (BELUM ADA)
-  - cloudflare/shared/src/bot/cart/store.ts (tabel carts/cart_items sudah ada),
-    cloudflare/shared/src/bot/contacts/sync.ts (disebut di komentar policy.ts
-    sebagai pemilik refresh berkala no_ai; WuzapiClient.getContacts() sudah ada,
-    belum ada pemanggilnya).
-  - Tanpa sync: kontak yang di-rename menjadi "no_ai" tetap terdeteksi lewat
-    Info.PushName pada tiap pesan, tetapi tabel contacts tidak pernah terisi.
-FASE 5 - Turso + Sumopod + Telegram + outbox (BELUM ADA): lihat bagian 6.
-FASE 6 - nota PDF + rate limit + typing (BELUM ADA)
-  - cloudflare/shared/src/bot/nota/pdf.ts + sumber daya/HTML template.
-  - sendPresence("composing"/"paused") sudah ada di WuzapiClient dan BELUM
-    dipanggil; rate limit token bucket sudah berjalan (kapasitas 30, refill
-    0,5/detik) sehingga FASE 6 berarti penajaman (per-nomor, antrean, metrik),
-    bukan pembuatan dari nol.
-FASE 7 - cron/reconcile + DLQ lanjutan + observability (BELUM ADA)
-  - Handler scheduled() belum ada di cloudflare/shared/src/worker.ts (hanya ada
-    fetch() dan queue()), padahal CONTACT_SYNC_INTERVAL_MINUTES dan
-    RECONCILE_INTERVAL_MINUTES sudah dibaca config.
-  - Rekonsiliasi outbox + prune history (pruneHistory() sudah ada di history.ts,
-    belum ada pemanggilnya).
-  - Consumer DLQ dasar SUDAH ADA (consumer/dlq.ts); FASE 7 menambah metrik,
-    rekap harian, dan alert lanjutan.
+FASE 3 - knowledge + AI agent (SELESAI)
+  - cloudflare/scripts/sync-knowledge.mjs: satu perintah mengunggah prompt.txt,
+    knowledge.txt, ongkir-policy.json, dan folder gambar; target KV atau R2
+    mengikuti KNOWLEDGE_MODE (aturan yang sama dengan loader), setiap objek
+    dibaca ulang untuk verifikasi, dan indeks D1 dibangun lewat
+    POST /admin/knowledge/sync. Flag: --prompt --knowledge --images
+    --ongkir-policy --mode --local --url --admin-key --skip-index --dry-run.
+  - Modul: knowledge/{sync,search,chunker,loader,catalog}.ts, agent/{prompt,llm,
+    tools,run}.ts, sales/cart.service.ts.
+FASE 4 - cart + kontak sync (SELESAI)
+  - sales/cart.service.ts (tabel carts/cart_items; harga selalu dari katalog),
+    contacts/sync.ts (GET /user/contacts -> contacts + saklar no_ai),
+    rute POST /admin/contacts/sync, dan job cron contact_sync dengan interval
+    CONTACT_SYNC_INTERVAL_MINUTES.
+  - Aturan no_ai bersifat transisi: bot_enabled hanya ditulis saat kontak pertama
+    kali terlihat, saat marker muncul/hilang, atau saat chat disupresi manual -
+    sehingga sync berkala tidak pernah membatalkan keputusan admin.
+FASE 5 - Turso + Telegram + Sumopod (dry-run) + outbox (SELESAI)
+  - 5a: payment/schema.ts (DDL), payment/sql.ts (seam + PaymentDbError),
+    payment/turso.ts (repository idempoten), payment/libsql-client.ts
+    (@libsql/client/web), scripts/turso-smoke.mjs.
+  - 5b: telegram/{client,cards,webhook,pending}.ts, payment/{provider,checkout,
+    events,settle,routes,messages}.ts, outbox/{store,flush}.ts,
+    rute /webhooks/telegram, /payment/callback, /dry-run/<kode_bayar>,
+    dan /admin/orders/* sebagai jalur tanpa Telegram.
+FASE 6 - nota PDF + rate limit + typing (SELESAI)
+  - nota/pdf.ts (pdf-lib; judul NOTA PEMBAYARAN, nomor nota + kode pesanan, tabel
+    item, subtotal/biaya tambahan/ongkir/total, Dibayar <WIB>, Status LUNAS,
+    nama berkas Nota-<order_ref>.pdf) dengan fallback teks yang tidak bisa gagal.
+  - sendPresence("composing"/"paused") dipanggil pipeline; deliverOutbound
+    menambah jeda manusiawi 1-3 detik antar pesan; token bucket tetap 30 burst /
+    0,5 token per detik.
+FASE 7 - cron + reconcile + DLQ alert (SELESAI)
+  - cron.ts dipanggil dari scheduled() (trigger "*/1 * * * *"): outbox_flush,
+    expire_orders, reconcile_payments (di-skip saat dry-run),
+    contact_sync, retry_unreplied (RETRY_UNREPLIED_MINUTES, 0 = mati),
+    prune_history (90 hari + kartu Telegram 72 jam).
+  - Job interval diklaim lewat cron_state (UPDATE kondisional) sehingga tidak
+    dobel; satu job gagal tidak membatalkan job lain.
+  - DLQ sekarang juga mengirim alert ke Telegram (log "dlq_alert"), di samping
+    ALERT_WEBHOOK_URL.
+FASE 8 - E2E + dokumentasi (SELESAI)
+  - scripts/mock-services.mjs (wuzapi + Telegram + AI), scripts/mock-turso.mjs
+    (libSQL/hrana di atas SQLite), scripts/e2e-bot.mjs (33 pemeriksaan).
+  - Dokumentasi: README bagian 8 (order/pembayaran/nota, cron, E2E) dan
+    docs/wuzip-bot-runbook.txt bagian 10-14 (Turso, Telegram, pembayaran,
+    E2E, cron).
 FASE 9 - voice (BELUM ADA)
-  - cloudflare/shared/src/bot/voice/transcribe.ts (unduh media audio, kirim ke
-    endpoint transkripsi, jadikan teks). VOICE_ENABLED sudah ada di config dan
-    wrangler.jsonc (default "false") tetapi belum cukup: tanpa transkripsi,
-    pesan audio tetap berakhir empty_body.
-FASE 8 tidak dirujuk oleh kode maupun brief ini; isi dan urutannya perlu
-dikonfirmasi sebelum dijadikan rencana.
+  - bot/voice/transcribe.ts belum ada. VOICE_ENABLED sudah dibaca config dan
+    wrangler.jsonc (default "false"); tanpa transkripsi, pesan audio berakhir
+    empty_body (lihat bagian 5).
 
 
 8. RINGKASAN SATU LAYAR
@@ -512,5 +542,17 @@ deliveryId) -> Queue wuzapi-<nomor>-events -> consumer:
   BOT_MODE=shadow : pipeline penuh, tidak ada yang dikirim ke customer
   BOT_MODE=on     : pipeline penuh + balasan dikirim
 pipeline: filter -> policy -> lock DO -> claim D1 -> history -> responder
-          -> deliver (token bucket) -> settle (processed_events 'done' + lock
-          dilepas) -> ack; gagal sementara -> retry, gagal permanen -> ack/DLQ.
+          -> typing + deliver (token bucket, jeda 1-3 s) -> settle
+          (processed_events 'done' + lock dilepas) -> ack; gagal sementara ->
+          retry, gagal permanen -> ack/DLQ.
+
+checkout: cart (D1) -> order (Turso, client_ref idempoten) -> ongkir termasuk?
+          ya  -> tautan (dry-run {PUBLIC_BASE_URL}/dry-run/<kode_bayar> | Sumopod)
+                 -> pending -> callback -> payment.event -> paid -> nota PDF
+          tidak -> awaiting_approval -> kartu Telegram -> approved -> tautan
+setiap pesan ke customer yang tidak boleh hilang lewat outbox (dedupe_key +
+lease + msgid deterministik), di-flush cron tiap menit atau outbox.tick.
+
+cron tiap menit: outbox_flush, expire_orders, reconcile_payments,
+                 contact_sync (per CONTACT_SYNC_INTERVAL_MINUTES),
+                 retry_unreplied (opsional), prune_history (harian).

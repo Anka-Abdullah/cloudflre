@@ -77,14 +77,32 @@
     "PAYMENT_EXPIRES_HOURS": "24",
     // true: build the payment link and log it instead of calling the gateway.
     "PAYMENT_DRY_RUN": "true",
+    // Endpoint paths on PAYMENT_API_BASE (kept in vars so a change of API version
+    // is a config change, not a code change).
+    "PAYMENT_CREATE_PATH": "/v1/payments",
+    "PAYMENT_STATUS_PATH": "/v1/payments/{ref}",
     "TELEGRAM_ENABLED": "false",
+    // Telegram API root; override in tests to point at a mock server.
+    "TELEGRAM_API_BASE": "https://api.telegram.org",
     // Public base URL of this worker; used for the gateway callback URL.
     "PUBLIC_BASE_URL": "",
     "BOT_MAX_ITEMS": "20",
     "BOT_MAX_ITEM_QTY": "99",
     "OUTBOX_BATCH": "20",
+    // A claimed outbox row is owned for this long; a crashed flusher is retried after it.
+    "OUTBOX_LEASE_SECONDS": "120",
+    // After this many attempts a row is marked failed instead of retried forever.
+    "OUTBOX_MAX_ATTEMPTS": "6",
+    // 0 = off. When > 0, a chat whose last inbound message is older than this and
+    // was never answered gets one holding message (deduped per inbound message).
+    "RETRY_UNREPLIED_MINUTES": "0",
     "RECONCILE_INTERVAL_MINUTES": "1",
     "VOICE_ENABLED": "false"
+  },
+  // The cron owns everything that has no incoming message to trigger it:
+  // outbox flush, order expiry, payment reconciliation, contact sync, pruning.
+  "triggers": {
+    "crons": ["*/1 * * * *"]
   },
   "queues": {
     "producers": [

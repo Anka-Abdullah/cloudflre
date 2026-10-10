@@ -46,13 +46,19 @@ export interface Env {
   CONTACT_SYNC_INTERVAL_MINUTES?: string;
   PAYMENT_PROVIDER?: string;
   PAYMENT_API_BASE?: string;
+  PAYMENT_CREATE_PATH?: string;
+  PAYMENT_STATUS_PATH?: string;
   PAYMENT_EXPIRES_HOURS?: string;
   PAYMENT_DRY_RUN?: string;
   TELEGRAM_ENABLED?: string;
+  TELEGRAM_API_BASE?: string;
   PUBLIC_BASE_URL?: string;
   BOT_MAX_ITEMS?: string;
   BOT_MAX_ITEM_QTY?: string;
   OUTBOX_BATCH?: string;
+  OUTBOX_LEASE_SECONDS?: string;
+  OUTBOX_MAX_ATTEMPTS?: string;
+  RETRY_UNREPLIED_MINUTES?: string;
   RECONCILE_INTERVAL_MINUTES?: string;
   VOICE_ENABLED?: string;
 
@@ -148,6 +154,10 @@ export interface BotConfig {
   contactSyncIntervalMinutes: number;
   paymentProvider: PaymentProviderName;
   paymentApiBase: string;
+  /** Path appended to PAYMENT_API_BASE to create a payment link. */
+  paymentCreatePath: string;
+  /** Template for a status query; `{ref}` is replaced by the provider reference. */
+  paymentStatusPath: string;
   paymentApiKey: string;
   paymentCallbackSecret: string;
   paymentExpiresHours: number;
@@ -156,6 +166,8 @@ export interface BotConfig {
   telegramBotToken: string;
   telegramChatId: string;
   telegramWebhookSecret: string;
+  /** Telegram API root; overridable so tests and mocks never touch the real API. */
+  telegramApiBase: string;
   publicBaseUrl: string;
   adminApiKey: string;
   tursoDatabaseUrl: string;
@@ -163,6 +175,12 @@ export interface BotConfig {
   maxItems: number;
   maxItemQty: number;
   outboxBatch: number;
+  /** How long one flusher owns a claimed outbox row. */
+  outboxLeaseSeconds: number;
+  /** After this many attempts a row is marked failed instead of retried forever. */
+  outboxMaxAttempts: number;
+  /** 0 disables the "chat was never answered" job; >0 is the age threshold. */
+  retryUnrepliedMinutes: number;
   reconcileIntervalMinutes: number;
   voiceEnabled: boolean;
 }
@@ -270,6 +288,8 @@ function loadBotConfig(env: Env): BotConfig {
     ),
     paymentProvider: enumVar("PAYMENT_PROVIDER", env.PAYMENT_PROVIDER, ["sumopod"] as const, "sumopod"),
     paymentApiBase: baseUrl(env.PAYMENT_API_BASE),
+    paymentCreatePath: trimmed(env.PAYMENT_CREATE_PATH) || "/v1/payments",
+    paymentStatusPath: trimmed(env.PAYMENT_STATUS_PATH) || "/v1/payments/{ref}",
     paymentApiKey: trimmed(env.PAYMENT_API_KEY),
     paymentCallbackSecret: trimmed(env.PAYMENT_CALLBACK_SECRET),
     paymentExpiresHours: intVar("PAYMENT_EXPIRES_HOURS", env.PAYMENT_EXPIRES_HOURS, 24, 1, 720),
@@ -278,6 +298,7 @@ function loadBotConfig(env: Env): BotConfig {
     telegramBotToken: trimmed(env.TELEGRAM_BOT_TOKEN),
     telegramChatId: trimmed(env.TELEGRAM_CHAT_ID),
     telegramWebhookSecret: trimmed(env.TELEGRAM_WEBHOOK_SECRET),
+    telegramApiBase: baseUrl(env.TELEGRAM_API_BASE) || "https://api.telegram.org",
     publicBaseUrl: baseUrl(env.PUBLIC_BASE_URL),
     adminApiKey: trimmed(env.ADMIN_API_KEY),
     tursoDatabaseUrl: trimmed(env.TURSO_DATABASE_URL),
@@ -285,6 +306,9 @@ function loadBotConfig(env: Env): BotConfig {
     maxItems: intVar("BOT_MAX_ITEMS", env.BOT_MAX_ITEMS, 20, 1, 500),
     maxItemQty: intVar("BOT_MAX_ITEM_QTY", env.BOT_MAX_ITEM_QTY, 99, 1, 10_000),
     outboxBatch: intVar("OUTBOX_BATCH", env.OUTBOX_BATCH, 20, 1, 100),
+    outboxLeaseSeconds: intVar("OUTBOX_LEASE_SECONDS", env.OUTBOX_LEASE_SECONDS, 120, 10, 3_600),
+    outboxMaxAttempts: intVar("OUTBOX_MAX_ATTEMPTS", env.OUTBOX_MAX_ATTEMPTS, 6, 1, 50),
+    retryUnrepliedMinutes: intVar("RETRY_UNREPLIED_MINUTES", env.RETRY_UNREPLIED_MINUTES, 0, 0, 1_440),
     reconcileIntervalMinutes: intVar(
       "RECONCILE_INTERVAL_MINUTES",
       env.RECONCILE_INTERVAL_MINUTES,

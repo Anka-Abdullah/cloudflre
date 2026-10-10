@@ -71,6 +71,55 @@ https://__WORKER_NAME__.<subdomain-akun>.workers.dev/ingest/<INGEST_TOKEN>
 
 Setelah itu setiap event nomor ini masuk ke queue `__QUEUE__`.
 
+## 5b. Turso, Telegram, dan pembayaran
+
+Ketiganya opsional untuk menjalankan bot, tetapi dibutuhkan begitu pelanggan
+boleh checkout:
+
+```sh
+export TURSO_DATABASE_URL=libsql://<host-anda>
+export TURSO_AUTH_TOKEN=<token>
+export TELEGRAM_BOT_TOKEN=<token BotFather>
+export TELEGRAM_WEBHOOK_SECRET=<secret acak>
+export ADMIN_API_KEY=<secret acak>
+pnpm run secrets -- --number 6281234567890 --from-env
+pnpm run smoke:turso -- --number 6281234567890 --local-secrets   # verifikasi schema + CRUD
+```
+
+- `TELEGRAM_CHAT_ID` diambil dari balasan bot saat admin menekan `/start`.
+- Daftarkan webhook Telegram ke `https://<worker>/webhooks/telegram` dengan
+  `secret_token` = `TELEGRAM_WEBHOOK_SECRET`.
+- Biarkan `PAYMENT_DRY_RUN=true` (default) sampai kunci Sumopod siap: tautan
+  pembayaran menunjuk `{PUBLIC_BASE_URL}/dry-run/<kode_bayar>` dan tidak ada
+  gateway yang dipanggil. Isi `PUBLIC_BASE_URL` dengan URL worker ini.
+- Tanpa Telegram, approval dikerjakan lewat
+  `POST /admin/orders/<kode>/approve|reject`.
+
+Langkah lengkapnya ada di `../docs/wuzip-bot-runbook.txt` bagian 10-14.
+
+## 5b. Turso, Telegram, dan pembayaran
+
+Ketiganya opsional untuk menjalankan bot, tetapi dibutuhkan begitu pelanggan boleh
+checkout:
+
+```sh
+export TURSO_DATABASE_URL=libsql://<host-anda>
+export TURSO_AUTH_TOKEN=<token>
+export TELEGRAM_BOT_TOKEN=<token BotFather>
+export TELEGRAM_WEBHOOK_SECRET=<secret acak>
+export ADMIN_API_KEY=<secret acak>
+pnpm run secrets -- --number __SLUG__ --from-env
+pnpm run smoke:turso -- --number __SLUG__ --local-secrets
+```
+
+- `TELEGRAM_CHAT_ID` diambil dari balasan bot saat admin menekan `/start`.
+- Webhook Telegram: `https://<worker>/webhooks/telegram` dengan `secret_token`.
+- `PAYMENT_DRY_RUN=true` (default) tidak memanggil gateway: tautannya
+  `{PUBLIC_BASE_URL}/dry-run/<kode_bayar>`. Isi `PUBLIC_BASE_URL` dengan URL worker.
+- Tanpa Telegram: `POST /admin/orders/<kode>/approve|reject` (Bearer `ADMIN_API_KEY`).
+
+Langkah lengkapnya: `../docs/wuzip-bot-runbook.txt` bagian 10-14.
+
 ## 6. Nyalakan bot (shadow dulu, jangan langsung on)
 
 | `BOT_MODE` | Perilaku |
@@ -101,7 +150,10 @@ yang belum diisi. Rollback = set `BOT_MODE=off` lalu deploy.
 | `pnpm run migrate -- --number __SLUG__` | terapkan skema D1 (`--local` untuk database lokal) |
 | `pnpm run secrets -- --number __SLUG__` | perbarui secret (`--list`, `--from-env`, `--set`, `--generate`) |
 | `pnpm run provision -- --number __SLUG__` | buat queue/DLQ/bucket/D1/KV (idempoten) |
-| `pnpm run knowledge -- --number __SLUG__` | unggah prompt/knowledge — baru ada di FASE 3 |
+| `pnpm run knowledge -- --number __SLUG__ --prompt <file> --knowledge <file>` | unggah prompt/knowledge (+ `--images <dir>`, + rebuild indeks D1 lewat `--url`) |
+| `pnpm run smoke:turso -- --number __SLUG__ --local-secrets` | uji schema + CRUD Turso (tanpa kredensial: SQLite lokal) |
+| `pnpm run e2e -- --number __SLUG__` | E2E penuh tanpa nomor WA (mock wuzapi/Telegram/AI/Turso) |
+| `curl -H "Authorization: Bearer $ADMIN_API_KEY" https://<worker>/admin/status` | ringkasan Turso/Telegram/outbox |
 
 ## Uji cepat
 

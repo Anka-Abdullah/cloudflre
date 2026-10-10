@@ -82,7 +82,12 @@ function buildEnvelope(
 }
 
 interface Harness {
+  /** Every outbound call, in order. */
   calls: { url: string; method: string; token: string | null; body: Record<string, unknown> }[];
+  /** Only `/chat/send/*`: the calls that put a message in front of a customer. */
+  sends: { url: string; method: string; token: string | null; body: Record<string, unknown> }[];
+  /** Only `/chat/presence`: the typing indicator (FASE 6). */
+  presence: { url: string; method: string; token: string | null; body: Record<string, unknown> }[];
   logs: string[];
   contexts: ReplyContext[];
 }
@@ -100,7 +105,7 @@ async function run(
   envelopes: EnvelopeV1[],
   options: RunOptions = {},
 ): Promise<{ harness: Harness; result: Awaited<ReturnType<typeof getQueueResult>> }> {
-  const harness: Harness = { calls: [], logs: [], contexts: [] };
+  const harness: Harness = { calls: [], sends: [], presence: [], logs: [], contexts: [] };
 
   const batch = createMessageBatch(
     "wuzip-shared-test-events",
@@ -135,8 +140,14 @@ async function run(
         const url = String(input);
         const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
         const headers = new Headers(init?.headers);
-        harness.calls.push({ url, method: init?.method ?? "GET", token: headers.get("token"), body });
-        if (options.responder) return options.responder(url, harness.calls.length);
+        const call = { url, method: init?.method ?? "GET", token: headers.get("token"), body };
+        harness.calls.push(call);
+        if (url.includes("/chat/send/")) harness.sends.push(call);
+        if (url.includes("/chat/presence")) harness.presence.push(call);
+
+        // The simulated outage/rejection applies to sends only: the typing
+        // indicator is best-effort and must not change what these tests assert.
+        if (options.responder && url.includes("/chat/send/")) return options.responder(url, harness.sends.length);
         return new Response(JSON.stringify({ code: 200, success: true, data: { Id: "WA-OUT-1" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -184,8 +195,8 @@ describe("BOT_MODE=on", () => {
     });
 
     expect(result.explicitAcks).toEqual(["message-1"]);
-    expect(harness.calls).toHaveLength(1);
-    const call = harness.calls[0];
+    expect(harness.sends).toHaveLength(1);
+    const call = harness.sends[0];
     expect(call?.url).toBe("https://wuzapi.example.test/chat/send/text");
     expect(call?.method).toBe("POST");
     expect(call?.token).toBe("test-wuzapi-token");
@@ -217,7 +228,7 @@ describe("BOT_MODE=on", () => {
     const { harness } = await run([
       buildEnvelope("d-caption", CHAT, { imageMessage: { caption: "ini masih ada?", base64: "AAAA" } }),
     ]);
-    expect(harness.calls).toHaveLength(1);
+    expect(harness.sends).toHaveLength(1);
     expect(harness.contexts[0]?.message.kind).toBe("caption");
     expect(harness.contexts[0]?.message.body).toBe("ini masih ada?");
   });
@@ -228,10 +239,10 @@ describe("idempotency", () => {
     const envelope = buildEnvelope("d-dup", CHAT, { conversation: "halo" });
 
     const first = await run([envelope]);
-    expect(first.harness.calls).toHaveLength(1);
+    expect(first.harness.sends).toHaveLength(1);
 
     const second = await run([envelope]);
-    expect(second.harness.calls).toHaveLength(0);
+    expect(second.harness.sends).toHaveLength(0);
     expect(second.harness.contexts).toHaveLength(0);
     expect(second.result.explicitAcks).toEqual(["message-1"]);
     expect(second.harness.logs).toContain("info:event_duplicate");
@@ -282,7 +293,18 @@ describe("degraded configuration", () => {
 
   it("answers normally once the secret is present", async () => {
     const { harness } = await run([buildEnvelope("d-configured", CHAT, { conversation: "halo" })], { mode: "on" });
-    expect(harness.calls).toHaveLength(1);
+    expect(harness.sends).toHaveLength(1);
+  });
+
+  it("shows and clears the typing indicator around the reply", async () => {
+    const { harness } = await run([buildEnvelope("d-typing", CHAT, { conversation: "halo" })], { mode: "on" });
+
+    expect(harness.presence.map((call) => call.body["State"])).toEqual(["composing", "paused"]);
+    expect(harness.presence[0]?.url).toBe("https://wuzapi.example.test/chat/presence");
+    expect(harness.presence[0]?.token).toBe("test-wuzapi-token");
+    // composing → send → paused, so the bubble covers the model's thinking time.
+    const order = harness.calls.map((call) => (call.url.includes("/chat/presence") ? String(call.body["State"]) : "send"));
+    expect(order).toEqual(["composing", "send", "paused"]);
   });
 });
 
@@ -357,7 +379,7 @@ describe("outbound failures", () => {
 
     // The retry re-claims the failed delivery and sends exactly once.
     const recovered = await run([buildEnvelope("d-flaky", CHAT, { conversation: "halo" })]);
-    expect(recovered.harness.calls).toHaveLength(1);
+    expect(recovered.harness.sends).toHaveLength(1);
     expect(recovered.result.explicitAcks).toEqual(["message-1"]);
 
     const done = await db
@@ -388,7 +410,7 @@ describe("outbound failures", () => {
     // lock the failed attempt took.
     const next = await run([buildEnvelope("d-after-permanent", CHAT, { conversation: "halo lagi" })]);
     expect(next.result.explicitAcks).toEqual(["message-1"]);
-    expect(next.harness.calls).toHaveLength(1);
+    expect(next.harness.sends).toHaveLength(1);
   });
 });
 
@@ -414,7 +436,7 @@ describe("WuzAPI client retry ladder", () => {
       },
     });
     expect(seen).toBe(2);
-    expect(harness.calls).toHaveLength(2);
+    expect(harness.sends).toHaveLength(2);
     expect(harness.logs).toContain("warn:wuzapi_retry");
   });
 });

@@ -6,7 +6,8 @@ Ruang lingkup : diagram, resource per nomor, KONTRAK QUEUE yang dibekukan, bentu
 Pasangan      : wuzip-bot-flow.txt (alur), wuzip-bot-runbook.txt (operasi).
 Path          : relatif terhadap root repo /Users/ank/project/wuzip-bot
 Aturan        : TIDAK ADA nilai secret di dokumen ini. Hanya nama variabel.
-                Sesuatu yang belum ada kodenya ditandai "RENCANA (FASE n)".
+                Sejak FASE 8, FASE 0-8 sudah ada kodenya dan terverifikasi;
+                yang masih ditandai "RENCANA" hanya FASE 9 (voice).
 
 
 1. DIAGRAM
@@ -63,7 +64,7 @@ Aturan        : TIDAK ADA nilai secret di dokumen ini. Hanya nama variabel.
        |         |        |        |                    |          |
        |         |        |        |                    |          +--> WuzAPI REST
        |         |        |        |                    |               (kirim balasan)
-       |         |        |        |                    +--> RENCANA (FASE 3):
+       |         |        |        |                    +--> ADA (FASE 3):
        |         |        |        |                         HTTP ke AI (OpenAI-compatible)
        |         |        |        +--> D1 BOT_DB (processed_events, messages, ...)
        |         |        +--> Durable Object ChatCoordinator
@@ -73,16 +74,19 @@ Aturan        : TIDAK ADA nilai secret di dokumen ini. Hanya nama variabel.
        +--> murni CPU (shared/src/bot/filter.ts)
 
   Panggilan HTTP opsional (semua lewat fetch, tanpa binding Cloudflare):
-    AI        : AI_BASE_URL + AI_API_KEY            -> RENCANA (FASE 3)
-    Turso     : TURSO_DATABASE_URL + TURSO_AUTH_TOKEN -> RENCANA (FASE 5), HTTP libsql
-    Sumopod   : PAYMENT_API_BASE + PAYMENT_API_KEY  -> RENCANA (FASE 5)
-    Telegram  : TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID -> RENCANA (FASE 5)
+    AI        : AI_BASE_URL + AI_API_KEY            -> ADA (FASE 3)
+    Turso     : TURSO_DATABASE_URL + TURSO_AUTH_TOKEN -> ADA (FASE 5a), HTTP libsql
+    Sumopod   : PAYMENT_API_BASE + PAYMENT_API_KEY  -> ADA (FASE 5b, dipakai saat
+                                                        PAYMENT_DRY_RUN=false)
+    Telegram  : TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID -> ADA (FASE 5b)
     Downstream: DOWNSTREAM_URL + DOWNSTREAM_HMAC_KEY -> ADA (BOT_MODE=off)
     Alert DLQ : ALERT_WEBHOOK_URL                    -> ADA (opsional)
 
-  cron / scheduled() -> RENCANA (FASE 7). worker.ts hari ini hanya mengekspor
-  fetch() dan queue(); belum ada handler scheduled sehingga
-  CONTACT_SYNC_INTERVAL_MINUTES dan RECONCILE_INTERVAL_MINUTES belum berefek.
+  cron / scheduled() -> ADA (FASE 7). Trigger "*/1 * * * *" per nomor; handler
+  scheduled() memanggil runCronJobs() (shared/src/cron.ts): flush outbox, expire
+  order, rekonsiliasi pembayaran, sync kontak, retry chat belum dibalas, prune.
+  Job interval diklaim lewat tabel cron_state (UPDATE kondisional), sehingga dua
+  invokasi yang tumpang tindih tidak menjalankan job yang sama dua kali.
 
 
 2. RESOURCE PER NOMOR DAN KONVENSI NAMANYA
@@ -105,7 +109,7 @@ antar nomor selain kode di cloudflare/shared/.
 |                  |                               | migrations)                   |
 | KV namespace     | WUZIPBOT_KNOWLEDGE_<nomor>    | binding KNOWLEDGE_KV          |
 | Durable Object   | class ChatCoordinator         | binding CHAT_COORDINATOR      |
-| Turso            | RENCANA (FASE 5): satu DB     | secret TURSO_DATABASE_URL /   |
+| Turso            | ADA (FASE 5a): satu DB        | secret TURSO_DATABASE_URL /   |
 |                  | per nomor (atau per tenant)   | TURSO_AUTH_TOKEN              |
 | Secret           | 14 nama, lihat bagian 8       | wrangler secret put           |
 +------------------+-------------------------------+-------------------------------+
@@ -180,10 +184,10 @@ consumer, tidak ada tabel antrean di database.
 |                | metadata + pointer                                           |
 | wuzapi.event   | alias eksplisit untuk dua di atas, supaya produsen eksternal |
 |                | bisa menyebut sumbernya                                      |
-| payment.event  | callback gateway pembayaran / aksi admin Telegram -          |
-|                | RENCANA (FASE 5); hari ini hanya di-ack                      |
-| outbox.tick    | "flush outbox sekarang" - RENCANA (FASE 5); hari ini hanya   |
-|                | di-ack                                                       |
+| payment.event  | callback gateway / halaman dry-run / aksi admin - SATU-      |
+|                | SATUNYA penulis status order (FASE 5b). Idempotensinya id    |
+|                | beku: <order_ref>:<status>:<provider_ref|paid_at|''>          |
+| outbox.tick    | "flush outbox sekarang" (FASE 5b); cron tetap jalur utama    |
 +----------------+--------------------------------------------------------------+
 isWuzapiEventKind(kind) mengembalikan true untuk "event", "media-pointer", dan
 "wuzapi.event"; ketiganya masuk ke handleWuzapiEvent().
@@ -264,7 +268,7 @@ instanceName/userID dari byte awal body.
   direkomendasikan tetap webhook per nomor dari dashboard.
 
 
-5. SKEMA D1 (SUDAH ADA - cloudflare/shared/src/bot/migrations/0001_init.sql)
+5. SKEMA D1 (SUDAH ADA - migrations/0001_init.sql + 0002_payment_outbox.sql)
 ---------------------------------------------------------------------------
 BOT_DB menyimpan state bot: idempotensi, history, saklar, knowledge, katalog.
 Order/payment TIDAK di sini (lihat bagian 6). Aturan yang membentuk skema:
@@ -324,7 +328,8 @@ Order/payment TIDAK di sini (lihat bagian 6). Aturan yang membentuk skema:
     claimed_until INTEGER DEFAULT 0 | created_at INTEGER NOT NULL | sent_at INTEGER
     index: idx_outbox_ready(status, next_attempt_at),
            idx_outbox_chat(chat_jid, created_at DESC)
-    Satu-satunya tempat kirim WuzAPI dicatat; belum ada kode yang menulisnya
+    Satu-satunya tempat kirim WuzAPI dicatat; ditulis oleh outbox/store.ts dan
+    dikirim oleh outbox/flush.ts
     (RENCANA FASE 5).
 
   knowledge_chunks
@@ -345,11 +350,27 @@ membuktikan UNIQUE messages.delivery_id serta PK processed_events menolak
 salinan kedua.
 
 
-6. SKEMA TURSO - DIBEKUKAN, BELUM DIMIGRASIKAN (FASE 5)
+6. SKEMA TURSO - DIBEKUKAN DAN SUDAH DITERAPKAN (FASE 5a)
 -------------------------------------------------------------------
-Status: SKEMA DIBAWAH INI SUDAH DIBEKUKAN (rencana kerja bagian 7, jawaban
-Q15). Yang belum ada hanyalah kodenya: belum ada DDL Turso di repo, dan
-payment/turso.ts baru dibuat di FASE 5.
+Status: DDL-nya ADA di shared/src/bot/payment/schema.ts (array TURSO_SCHEMA, satu
+sumber kebenaran yang juga dipakai scripts/turso-smoke.mjs dan diuji lewat
+SQLite asli di shared/test/payment-turso.test.ts). Worker menerapkannya sendiri
+saat pertama dipakai: ensureTursoSchemaOnce() menjalankan seluruh array
+"CREATE TABLE/INDEX IF NOT EXISTS" sekali per isolate, jadi database baru tidak
+butuh langkah manual. Repository-nya di shared/src/bot/payment/turso.ts.
+
+Dua kolom tambahan di luar ringkasan awal (keduanya dipakai kode):
+  orders.superseded_by   kode_pesanan order yang menggantikan order ini
+  payments.metode        metode pembayaran dari gateway (mis. qris)
+
+Catatan idempotensi yang berlaku di seluruh repository:
+  - pembuatan = INSERT OR IGNORE pada unique key bisnis; tabrakan berarti
+    "resume", bukan gagal (createOrder -> created:false);
+  - setiap perubahan status = UPDATE ... WHERE status IN (...), sehingga callback
+    kedua menjadi no-op (transitionOrder -> false);
+  - kegagalan driver dipetakan ke PaymentDbError { code, retryable, operation },
+    tidak pernah error mentah: not_configured | connection | constraint |
+    readonly | syntax | unknown.
 
 Akses: HTTP libsql langsung dari worker lewat @libsql/client/web (fetch), TANPA
 binding Cloudflare. URL dan token per nomor lewat secret TURSO_DATABASE_URL dan
@@ -684,13 +705,13 @@ f) E2E NYATA (wrangler dev + mock AI + mock WuzAPI + knowledge di KV lokal)
    <nomor>/wrangler.jsonc; tanpa itu wrangler membaca config root dan gagal
    dengan "No KV namespaces are configured" (pesan yang menyesatkan).
 
-g) BELUM ADA
+g) ADA (FASE 3)
    scripts/sync-knowledge.mjs, sehingga `pnpm run knowledge` masih berhenti
-   dengan pesan bahwa skripnya belum ada. Untuk sekarang unggah manual:
+   (scripts/sync-knowledge.mjs) mengunggah prompt/knowledge/gambar sekaligus:
      wrangler kv key put --config <nomor>/wrangler.jsonc --binding KNOWLEDGE_KV \
        --remote "knowledge/knowledge.txt" --path <file>
    (tambahkan --local --persist-to .wrangler/state untuk dev lokal).
-   create_payment_link masih mengembalikan "BELUM tersedia" (FASE 5).
+   create_payment_link sudah membuat order + tautan (FASE 5b); lihat bagian 10.
 
 
 7. KEPUTUSAN FASE 0 YANG SUDAH DIBUKTIKAN (FTS5)
@@ -755,13 +776,19 @@ produksi hanya masuk lewat `wrangler secret put`.
 | CONTACT_SYNC_INTERVAL_MINUTES | 10 (0 = mati)             | sync contacts (FASE 4)    |
 | PAYMENT_PROVIDER              | sumopod                   | nama provider             |
 | PAYMENT_API_BASE              | (kosong)                  | base URL gateway          |
+| PAYMENT_CREATE_PATH           | /v1/payments              | path buat tautan          |
+| PAYMENT_STATUS_PATH           | /v1/payments/{ref}        | path tanya status         |
 | PAYMENT_EXPIRES_HOURS         | 24                        | masa berlaku order        |
 | PAYMENT_DRY_RUN               | true                      | bangun link tanpa panggil |
 | TELEGRAM_ENABLED              | false                     | saklar kartu admin        |
-| PUBLIC_BASE_URL               | (kosong)                  | URL callback publik       |
+| TELEGRAM_API_BASE             | api.telegram.org          | root API (bisa ditimpa)   |
+| PUBLIC_BASE_URL               | (kosong)                  | URL callback + dry-run    |
 | BOT_MAX_ITEMS                 | 20                        | maks item per cart        |
 | BOT_MAX_ITEM_QTY              | 99                        | maks qty per item         |
 | OUTBOX_BATCH                  | 20                        | ukuran batch flush outbox |
+| OUTBOX_LEASE_SECONDS          | 120                       | masa sewa klaim outbox    |
+| OUTBOX_MAX_ATTEMPTS           | 6                         | batas percobaan kirim     |
+| RETRY_UNREPLIED_MINUTES       | 0 (mati)                  | chat belum dibalas        |
 | RECONCILE_INTERVAL_MINUTES    | 1                         | rekonsiliasi (FASE 7)     |
 | VOICE_ENABLED                 | false                     | saklar voice (FASE 9)     |
 +-------------------------------+---------------------------+---------------------------+
@@ -780,21 +807,23 @@ daftar nilai. Nilai tidak sah -> ConfigError -> /healthz 500 / log config_invali
 | DOWNSTREAM_HMAC_KEY         | tanda tangan relay ke bot lama   | BOT_MODE=off          |
 | ALERT_WEBHOOK_URL           | tujuan alert DLQ (opsional)      | opsional              |
 | WUZAPI_TOKEN                | header "token" ke REST wuzapi    | BOT_MODE != off       |
-| AI_API_KEY                  | bearer ke endpoint AI            | RENCANA (FASE 3)      |
-| TURSO_DATABASE_URL          | URL libsql                       | RENCANA (FASE 5)      |
-| TURSO_AUTH_TOKEN            | token libsql                     | RENCANA (FASE 5)      |
-| PAYMENT_API_KEY             | kunci gateway Sumopod            | RENCANA (FASE 5)      |
-| PAYMENT_CALLBACK_SECRET     | verifikasi callback gateway      | RENCANA (FASE 5)      |
-| TELEGRAM_BOT_TOKEN          | bot token Telegram               | RENCANA (FASE 5)      |
-| TELEGRAM_CHAT_ID            | chat penerima kartu admin        | RENCANA (FASE 5)      |
-| TELEGRAM_WEBHOOK_SECRET     | nilai X-Telegram-Bot-Api-Secret- | RENCANA (FASE 5)      |
+| AI_API_KEY                  | bearer ke endpoint AI            | BOT_MODE != off       |
+| TURSO_DATABASE_URL          | URL libsql (atau http:// mock)   | checkout/order        |
+| TURSO_AUTH_TOKEN            | token libsql                     | checkout/order        |
+| PAYMENT_API_KEY             | kunci gateway Sumopod            | PAYMENT_DRY_RUN=false |
+| PAYMENT_CALLBACK_SECRET     | verifikasi callback gateway      | PAYMENT_DRY_RUN=false |
+| TELEGRAM_BOT_TOKEN          | bot token Telegram               | TELEGRAM_ENABLED=true |
+| TELEGRAM_CHAT_ID            | chat penerima kartu admin        | TELEGRAM_ENABLED=true |
+| TELEGRAM_WEBHOOK_SECRET     | nilai X-Telegram-Bot-Api-Secret- | TELEGRAM_ENABLED=true |
 |                             | Token                            |                       |
-| ADMIN_API_KEY               | bearer untuk /admin/*            | RENCANA (FASE 5/6)    |
+| ADMIN_API_KEY               | bearer untuk /admin/*            | selalu (503 bila      |
+|                             |                                  | kosong)               |
 +-----------------------------+----------------------------------+-----------------------+
-Catatan: AI_API_KEY sudah ikut dihitung botReadiness(), jadi /healthz melaporkan
-bot.ready=false dan menyebut "AI_API_KEY" selama secret itu belum diset - walau
-FASE 3 belum ada. Itu disengaja: nomor yang belum siap AI jangan dinyalakan
-BOT_MODE=on tanpa sadar.
+Catatan: TURSO_* TIDAK ikut botReadiness(): chat tetap boleh berjalan saat Turso
+belum diisi, dan hanya tool create_payment_link yang menjawab
+"turso_not_configured". Sebaliknya AI_API_KEY ikut, jadi /healthz melaporkan
+bot.ready=false dan menyebut "AI_API_KEY" selama secret itu belum diset - nomor
+yang belum siap AI jangan dinyalakan BOT_MODE=on tanpa sadar.
 
 8.3 Binding
 
@@ -805,7 +834,7 @@ BOT_MODE=on tanpa sadar.
 | DLQ               | Queue DLQ           | ya                                      |
 | MEDIA             | Bucket R2           | ya                                      |
 | BOT_DB            | D1                  | ya untuk BOT_MODE != off                |
-| KNOWLEDGE_KV      | KV                  | RENCANA (FASE 3)                        |
+| KNOWLEDGE_KV      | KV                  | ADA (FASE 3)                            |
 | CHAT_COORDINATOR  | Durable Object      | ya untuk BOT_MODE != off (degradasi     |
 |                   |                     | tanpa lock bila tidak ada)              |
 +-------------------+---------------------+-----------------------------------------+
@@ -854,12 +883,26 @@ sekali. Tiga mekanisme berikut membuat itu aman.
       mengembalikan null dan pipeline berjalan tanpa lock - D1 tetap menjadi
       jaring pengaman.
 
-  9.3 Outbox lease (RENCANA FASE 5, skema sudah ada)
+  9.3 Outbox lease (ADA, FASE 5b; skema awal + migration 0002)
       status pending/claimed/sent/failed + attempts + next_attempt_at +
       claimed_until. Flush mengambil baris 'pending' yang siap, mengklaimnya
       (claimed, claimed_until = sekarang + lease), lalu menandai 'sent' atau
       'failed'. Lease membuat klaim milik worker yang mati kedaluwarsa dan bisa
       diambil ulang, tanpa dua pengirim bekerja pada baris yang sama.
+      Tiga lapis yang saling melengkapi (migration 0002 menambah dedupe_key,
+      lease_id, last_error):
+        dedupe_key UNIQUE   - mencegah baris kedua untuk peristiwa bisnis yang
+                              sama (mis. order:PAY-x:nota) walau pemanggilnya
+                              dijalankan ulang (callback ganda, cron balapan);
+        lease_id + klaim    - UPDATE kondisional pada kandidat; hanya satu pass
+                              yang memiliki baris sampai claimed_until lewat;
+        msgid deterministik - Id pesan = ob-<row id>, jadi kiriman ulang setelah
+                              crash memakai msgid yang sama dan WhatsApp membuang
+                              duplikatnya.
+      Gagal sementara -> pending + backoff; 4xx wuzapi atau attempts >=
+      OUTBOX_MAX_ATTEMPTS -> failed (alasan tersimpan di last_error).
+      Pemicu flush: cron tiap menit, envelope outbox.tick, atau
+      POST /admin/outbox/flush.
 
   9.4 Yang TIDAK (belum) tertutup - jujur, harus diketahui
       Ada satu jendela: bila wuzapi sudah menerima kirim tetapi worker mati
@@ -894,7 +937,76 @@ sekali. Tiga mekanisme berikut membuat itu aman.
       Sumber: cloudflare/shared/src/bot/queue/handlers.ts.
 
 
-10. BATASAN YANG MENGIKAT
+10. RUTE, TABEL, DAN MODUL FASE 4-8 (SEMUA TERVERIFIKASI)
+----------------------------------------------------------
+Rute HTTP worker (shared/src/worker.ts):
+
+  POST /ingest/<INGEST_TOKEN>     webhook wuzapi (token + HMAC)
+  GET  /healthz                   liveness + konfigurasi efektif (tanpa secret)
+  POST /webhooks/telegram         kartu approval admin; wajib header
+                                  X-Telegram-Bot-Api-Secret-Token yang cocok,
+                                  idempotensi per update_id ("tg:<id>")
+  POST /payment/callback          callback gateway; HMAC-SHA256 body mentah vs
+                                  PAYMENT_CALLBACK_SECRET, jawab 202 setelah
+                                  envelope payment.event masuk queue (503 bila
+                                  queue gagal, supaya gateway mengulang)
+  GET  /dry-run/<kode_bayar>      halaman simulasi (hanya PAYMENT_DRY_RUN=true)
+  POST /dry-run/<kode_bayar>/pay  tombol simulasi: mengirim payment.event yang
+                                  sama seperti callback asli (deliveryId stabil,
+                                  jadi menekan dua kali = duplikat)
+  POST /admin/knowledge/sync      tulis prompt/knowledge + rebuild chunks/FTS5/
+                                  catalog_products (invalidate semua cache)
+  POST /admin/contacts/sync       sync kontak sekarang
+  POST /admin/chats/<jid>         {"botEnabled": true|false}
+  GET  /admin/orders/<kode>       order + item + payment
+  POST /admin/orders/<kode>/approve  {"additionalFee": n, "reason": "..."}
+  POST /admin/orders/<kode>/reject   {"reason": "..."}
+  POST /admin/outbox/flush        kirim isi outbox sekarang (+ statistik)
+  GET  /admin/status              ringkasan Turso/Telegram/outbox untuk operator
+
+  Semua /admin/* butuh "Authorization: Bearer <ADMIN_API_KEY>"; tanpa secret itu
+  endpoint menjawab 503 (fail closed), bukan terbuka.
+
+Tambahan skema D1 (migration 0002_payment_outbox.sql):
+  outbox.dedupe_key      TEXT UNIQUE  - satu baris per peristiwa bisnis
+  outbox.lease_id        TEXT         - token klaim milik satu pass flush
+  outbox.last_error      TEXT         - alasan kegagalan terakhir
+  cron_state             (job PK, last_run_at, note) - klaim job interval
+  telegram_pending       (chat_id, message_id PK, order_ref, kind) - balasan
+                         "Ubah Biaya" dipetakan kembali ke order
+
+Modul baru (semuanya di shared/src/):
+  bot/knowledge/sync.ts       tulis KV/R2 + rebuild index D1
+  bot/contacts/sync.ts        GET /user/contacts -> contacts + saklar no_ai
+  bot/sales/cart.service.ts   keranjang; harga selalu dari katalog
+  bot/payment/schema.ts       DDL Turso (satu sumber kebenaran)
+  bot/payment/sql.ts          seam SqlClient + PaymentDbError + retry
+  bot/payment/turso.ts        repository customers/orders/order_items/payments
+  bot/payment/libsql-client.ts @libsql/client/web (HTTP, fetch-only)
+  bot/payment/provider.ts     PaymentProvider: dry-run | mock | Sumopod
+  bot/payment/checkout.ts     cart -> order -> approval -> tautan (idempoten)
+  bot/payment/settle.ts       payment.event -> paid/expired/failed + nota
+  bot/payment/events.ts       bentuk beku payment.event + deliveryId
+  bot/payment/routes.ts       /payment/callback + halaman dry-run
+  bot/payment/messages.ts     teks customer (rupiah + WIB)
+  bot/telegram/client.ts      Bot API: sendMessage/editMessageText/
+                              answerCallbackQuery/sendDocument + retry
+  bot/telegram/cards.ts       kartu approval + parser callback/fee
+  bot/telegram/webhook.ts     /webhooks/telegram
+  bot/telegram/pending.ts     telegram_pending (force_reply)
+  bot/outbox/store.ts         enqueue (dedupe) + klaim lease + mark
+  bot/outbox/flush.ts         kirim + backoff + msgid deterministik
+  bot/nota/pdf.ts             nota PDF (pdf-lib) + fallback teks
+  admin/routes.ts             seluruh /admin/*
+  cron.ts                     scheduled(): outbox, expire, reconcile, sync, prune
+
+Verifikasi yang mengunci semua ini: 471 uji vitest (23 berkas) dan
+`pnpm run e2e -- --number <nomor>` (33 pemeriksaan, wrangler dev + mock wuzapi/
+Telegram/AI + mock Turso di atas SQLite) - semuanya tanpa nomor WhatsApp dan
+tanpa akun Turso/Sumopod.
+
+
+11. BATASAN YANG MENGIKAT
 -------------------------
  1. Tanpa GOWA, tanpa Go tambahan, tanpa RabbitMQ, tanpa PostgreSQL. Proyek ini
     TypeScript di Cloudflare Workers; satu-satunya kode Go yang ada adalah wuzapi

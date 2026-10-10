@@ -18,6 +18,11 @@
 import { type Env, type InstanceConfig, botReadiness } from "../../config";
 import { type EnvelopeV1, type DlqRecord } from "../../envelope";
 import { createLogger, type Logger } from "../../lib/logger";
+import { flushOutbox } from "../outbox/flush";
+import { paymentPayloadOf } from "../payment/events";
+import { createTursoSqlClient, tursoConfigured } from "../payment/libsql-client";
+import { settlePayment } from "../payment/settle";
+import type { SqlClient } from "../payment/sql";
 import { claimChat, releaseChat, DEFAULT_LOCK_TTL_MS } from "../coordinator/chat-lock";
 import { resolveChatPolicy } from "../contacts/policy";
 import { filterInbound, type FilterResult } from "../filter";
@@ -45,6 +50,8 @@ export interface BotDeps {
   responder?: Responder;
   sleep?: (ms: number) => Promise<void>;
   sendDlq?: (record: DlqRecord) => Promise<unknown>;
+  /** Test seam: replaces the Turso client used by the payment handlers. */
+  sqlClient?: SqlClient;
 }
 
 export interface BotRuntime {
@@ -56,6 +63,10 @@ export interface BotRuntime {
   responder: Responder;
   sleep: (ms: number) => Promise<void>;
   sendDlq: (record: DlqRecord) => Promise<unknown>;
+  /** Null when Turso is not configured; the payment handlers degrade, not throw. */
+  sql: SqlClient | null;
+  /** True when the bot is allowed to send to customers (mode `on` and ready). */
+  deliver: boolean;
 }
 
 export interface BotRuntimeOptions {
@@ -110,7 +121,24 @@ export function createBotRuntime(options: BotRuntimeOptions): BotRuntime {
       }),
     sleep: deps.sleep ?? defaultSleep,
     sendDlq: deps.sendDlq ?? ((record: DlqRecord) => env.DLQ.send(record, { contentType: "json" })),
+    sql: sqlClientFor(config, deps.sqlClient),
+    // A number whose configuration is incomplete stays silent (`deliver` false)
+    // rather than sending a generic fallback to a real customer; see
+    // docs/wuzip-bot-architecture.txt section 9.6.
+    deliver: config.bot.mode === "on" && botReadiness(config, env).ready,
   };
+}
+
+/** Creates the Turso client once per batch, or null when it is not configured. */
+function sqlClientFor(config: InstanceConfig, injected?: SqlClient): SqlClient | null {
+  if (injected) return injected;
+  if (!tursoConfigured({ url: config.bot.tursoDatabaseUrl, authToken: config.bot.tursoAuthToken })) return null;
+  try {
+    return createTursoSqlClient({ url: config.bot.tursoDatabaseUrl, authToken: config.bot.tursoAuthToken });
+  } catch (error) {
+    createLogger({ slug: config.slug, handler: "bot" }).error("turso_client_failed", { error: String(error) });
+    return null;
+  }
 }
 
 /** The payload of a wuzapi event, recovered from the media pointer when needed. */
@@ -249,6 +277,11 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
     };
 
     const plan = await runtime.responder(context);
+
+    // The typing bubble covers the model's thinking time. It is best-effort: a
+    // wuzapi that refuses presence must not stop the answer itself.
+    await setTyping(runtime, message.chatJid, "composing");
+
     const outbound = await deliverOutbound(
       {
         env: runtime.env,
@@ -261,6 +294,7 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
       message.chatJid,
       plan.messages,
     );
+    await setTyping(runtime, message.chatJid, "paused");
 
     if (outbound.failures.length > 0) {
       const permanent = outbound.failures.every((failure) => failure.permanent);
@@ -312,8 +346,21 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
   }
 }
 
-async function settle(
-  runtime: BotRuntime,
+/**
+ * Shows or clears the "typing…" bubble. Only ever called when the bot is allowed
+ * to deliver, and never fatal: presence is a courtesy, not a delivery.
+ */
+async function setTyping(runtime: BotRuntime, chatJid: string, state: "composing" | "paused"): Promise<void> {
+  if (!runtime.deliver || chatJid === "") return;
+  try {
+    const result = await runtime.client.sendPresence(chatJid, state);
+    if (!result.ok) runtime.log.debug("typing_unavailable", { chatJid, state, error: result.error });
+  } catch (error) {
+    runtime.log.debug("typing_failed", { chatJid, state, error: String(error) });
+  }
+}
+
+async function settle(  runtime: BotRuntime,
   deliveryId: string,
   status: "done" | "failed",
   error?: string,
@@ -365,20 +412,132 @@ function withoutCurrent(history: ChatMessage[], message: InboundMessage): ChatMe
 }
 
 /**
- * Handles one `payment.event` envelope. Phase 5 owns the body; until then the
- * only producer of this kind is a manual `env.EVENTS.send`, so it is logged and
- * acknowledged rather than retried forever.
+ * Handles one `payment.event` envelope: the only place an order can become
+ * `paid`, `expired` or `failed`.
+ *
+ * The HTTP routes never touch the order tables; they enqueue this envelope
+ * instead, so the queue is the single writer and a webhook retry is harmless.
+ * Idempotency comes in two layers: `processed_events` (the frozen
+ * `<order_ref>:<status>:<provider_ref|paid_at>` delivery id) and the outbox
+ * `dedupe_key` on the receipt.
+ *
+ * Dispositions:
+ *   applied / duplicate / final state → ack
+ *   database or delivery failure       → retry, so the callback is not lost
  */
 export async function handlePaymentEvent(envelope: EnvelopeV1, runtime: BotRuntime): Promise<Disposition> {
-  runtime.log.info("payment_event", { deliveryId: envelope.deliveryId, kind: envelope.kind });
-  return { action: "ack", reason: "payment_event_phase5" };
+  const { log, config } = runtime;
+  const db = runtime.env.BOT_DB;
+  const at = runtime.now();
+
+  const payload = paymentPayloadOf(envelope);
+  if (!payload) {
+    log.warn("payment_event_unreadable", { deliveryId: envelope.deliveryId });
+    return { action: "ack", reason: "payment_event_unreadable" };
+  }
+
+  if (!runtime.sql) {
+    // Turso is required to settle anything. Acknowledging would lose the event,
+    // so it is retried; the cron/alert path surfaces the misconfiguration.
+    log.error("payment_event_no_database", { orderRef: payload.orderRef, hint: "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN" });
+    return { action: "retry", delaySeconds: 60 };
+  }
+
+  if (db && !(await claimDelivery(db, { deliveryId: envelope.deliveryId, chatJid: null, waMessageId: null, at: at.getTime() }))) {
+    log.info("payment_event_duplicate", { deliveryId: envelope.deliveryId, orderRef: payload.orderRef });
+    return { action: "ack", reason: "duplicate" };
+  }
+
+  const result = await settlePayment(
+    { env: runtime.env, sql: runtime.sql, log },
+    {
+      kodeBayar: payload.kodeBayar,
+      orderRef: payload.orderRef,
+      status: payload.status,
+      amount: payload.amount,
+      providerRef: payload.providerRef,
+      metode: payload.metode,
+      paidAt: payload.paidAt,
+      raw: payload.raw,
+      at: at.getTime(),
+    },
+  );
+
+  log.info("payment_event", {
+    deliveryId: envelope.deliveryId,
+    orderRef: payload.orderRef,
+    status: payload.status,
+    applied: result.applied,
+    reason: result.reason,
+    source: payload.source,
+  });
+
+  if (result.error !== "" && result.reason === "settle_failed") {
+    if (db) await finishDelivery(db, envelope.deliveryId, "failed", at.getTime(), result.error);
+    return { action: "retry", delaySeconds: 30 };
+  }
+
+  // The confirmation text is delivered directly when the bot may talk (the
+  // queue message is the only chance to answer quickly); the receipt always
+  // travels through the outbox, already queued by `settlePayment`.
+  if (result.applied && result.messages.length > 0) {
+    const outcome = await deliverOutbound(
+      { env: runtime.env, config, client: runtime.client, log, deliver: runtime.deliver, sleep: runtime.sleep },
+      result.order?.waChatJid ?? "",
+      result.messages,
+    );
+    if (result.order && !outcome.suppressed) {
+      for (const message of result.messages) {
+        if (message.kind === "text") {
+          await recordOutbound(db as D1Database, {
+            chatJid: result.order.waChatJid,
+            body: message.body,
+            kind: "text",
+            at: at.getTime(),
+          });
+        }
+      }
+    }
+    if (outcome.failures.length > 0 && !outcome.failures.every((failure) => failure.permanent)) {
+      if (db) await finishDelivery(db, envelope.deliveryId, "failed", at.getTime(), "confirmation send failed");
+      return { action: "retry", delaySeconds: 15 };
+    }
+  }
+
+  if (result.applied) {
+    // The receipt is queued (never sent inline), so it survives a wuzapi outage.
+    // Flushing right away is what keeps "paid" and "nota" a second apart instead
+    // of a cron tick apart; the cron remains the safety net for a failed flush.
+    const flushed = await flushOutbox({
+      env: runtime.env,
+      config,
+      client: runtime.client,
+      log,
+      now: runtime.now,
+      limit: 5,
+    });
+    log.info("payment_nota_flush", { sent: flushed.sent, retried: flushed.retried, claimed: flushed.claimed });
+  }
+
+  if (db) await finishDelivery(db, envelope.deliveryId, "done", at.getTime());
+  return { action: "ack", reason: result.reason };
 }
 
 /**
- * Handles one `outbox.tick` envelope. Phase 5 owns the flush; acknowledged for
- * the same reason as the payment event above.
+ * Handles one `outbox.tick` envelope: flush the outbox now.
+ *
+ * The cron does the same thing every minute; this exists so a test (or an
+ * operator) does not have to wait, and so the flush has a path that does not
+ * depend on the schedule being enabled.
  */
 export async function handleOutboxTick(envelope: EnvelopeV1, runtime: BotRuntime): Promise<Disposition> {
-  runtime.log.info("outbox_tick", { deliveryId: envelope.deliveryId, batch: runtime.config.bot.outboxBatch });
-  return { action: "ack", reason: "outbox_tick_phase5" };
+  const result = await flushOutbox({
+    env: runtime.env,
+    config: runtime.config,
+    client: runtime.client,
+    log: runtime.log,
+    now: runtime.now,
+  });
+  runtime.log.info("outbox_tick", { deliveryId: envelope.deliveryId, ...result });
+  return { action: "ack", reason: `flushed:${result.sent}` };
 }

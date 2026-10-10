@@ -13,7 +13,8 @@
  */
 import type { Env, InstanceConfig } from "../../config";
 import type { Logger } from "../../lib/logger";
-import { findProduct, addItem, readCart, removeItem, cartToPrompt, cartToCustomer, limitsOf } from "../sales/cart.service";
+import { findProduct, addItem, readCart, removeItem, clearCart, cartToPrompt, cartToCustomer, limitsOf } from "../sales/cart.service";
+import { startCheckout, textsToOutbound } from "../payment/checkout";
 import type { ResolvedProduct } from "../knowledge/catalog";
 import type { OutboundMessage } from "../types";
 import { formatRupiah } from "../utils/format";
@@ -281,9 +282,14 @@ async function removeFromCart(args: Record<string, unknown>, context: ToolContex
 }
 
 /**
- * Checkout. Deliberately NOT implemented in FASE 3: it needs the Turso order
- * tables, the Sumopod adapter and the Telegram approval card (FASE 5). Returning
- * a clear "not yet" keeps the model honest instead of letting it promise a link.
+ * Checkout: cart → order in Turso → (admin approval) → payment link.
+ *
+ * The tool does not decide anything about money: it hands the basket and the
+ * customer's name/address to `startCheckout`, which re-prices every line from the
+ * catalogue, writes the order once (idempotent by `client_ref`) and returns the
+ * customer-facing texts. Everything the model gets back is guidance plus the
+ * truth — including the honest "belum bisa" paths, which is what keeps it from
+ * promising a link that does not exist.
  */
 async function createPaymentLink(args: Record<string, unknown>, context: ToolContext): Promise<ToolOutcome> {
   const nama = asString(args["nama"]);
@@ -291,14 +297,67 @@ async function createPaymentLink(args: Record<string, unknown>, context: ToolCon
   if (nama === "" || alamat === "") {
     return { result: "create_payment_link gagal: butuh 'nama' dan 'alamat' pelanggan.", outbound: [], failed: true };
   }
-  context.log.warn("tool_checkout_not_available", { chatJid: context.chatJid, reason: "FASE 5 belum dikerjakan" });
-  return {
-    result:
-      "create_payment_link BELUM tersedia di tahap ini. Jangan menjanjikan link pembayaran. " +
-      "Katakan bahwa pesanan akan diproses admin, lalu rangkum pesanan dan minta konfirmasi alamat.",
-    outbound: [],
-    failed: true,
-  };
+
+  const db = context.env.BOT_DB;
+  if (!db) {
+    return {
+      result:
+        "create_payment_link gagal: database keranjang tidak tersedia. " +
+        "Jangan menjanjikan link pembayaran; katakan pesanan akan diproses admin.",
+      outbound: [],
+      failed: true,
+    };
+  }
+
+  const view = await readCart(db, context.chatJid, context.catalog);
+  if (view.lines.length === 0) {
+    return {
+      result: "Keranjang masih kosong, jadi belum ada yang bisa di-checkout. Tawarkan produknya dulu.",
+      outbound: [],
+      failed: true,
+    };
+  }
+
+  const outcome = await startCheckout({
+    env: context.env,
+    config: context.config,
+    chatJid: context.chatJid,
+    customer: { nama, alamat },
+    items: view.lines.map((line) => ({ kode: line.kode, qty: line.qty })),
+    catalog: context.catalog,
+    deps: { now: () => context.now, log: context.log },
+  });
+
+  if (!outcome.ok) {
+    context.log.warn("tool_checkout_failed", { chatJid: context.chatJid, reason: outcome.reason, error: outcome.error });
+    return {
+      result:
+        `create_payment_link gagal (${outcome.reason}): ${outcome.error}. ` +
+        "Jangan menjanjikan link pembayaran. Katakan pesanan akan diproses admin, lalu rangkum pesanan dan minta konfirmasi alamat.",
+      outbound: [],
+      failed: true,
+    };
+  }
+
+  // The basket is now an order: clearing it prevents a second checkout from
+  // charging the same items twice.
+  await clearCart(db, context.chatJid, context.now.getTime());
+
+  const guide =
+    outcome.reason === "awaiting_approval"
+      ? `Pesanan ${outcome.order?.kodePesanan ?? ""} dibuat dan menunggu persetujuan admin (ongkir belum termasuk). ` +
+        "Balasan ke pelanggan sudah disiapkan sistem; jangan menambah janji lain."
+      : `Pesanan ${outcome.order?.kodePesanan ?? ""} dibuat dan link pembayaran sudah disiapkan. ` +
+        "Balasan ke pelanggan sudah disiapkan sistem; jangan mengarang nomor pesanan atau nominal lain.";
+
+  context.log.info("tool_checkout_ok", {
+    chatJid: context.chatJid,
+    order: outcome.order?.kodePesanan ?? null,
+    reason: outcome.reason,
+    grandTotal: outcome.order?.grandTotal ?? null,
+  });
+
+  return { result: guide, outbound: textsToOutbound(outcome.messages), failed: false };
 }
 
 /** Executes one tool call. Never throws: a failure becomes text guidance. */

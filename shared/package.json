@@ -7,5 +7,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "types": "./src/index.ts"
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "pdf-lib": "^1.17.1"
+  }
 }

@@ -55,6 +55,9 @@ pnpm run migrate -- --number 6281234567890
 pnpm run deploy -- --number 6281234567890
 ```
 
+Cron `*/1 * * * *` ikut terpasang saat deploy (flush outbox, expire order,
+rekonsiliasi pembayaran, sync kontak, prune). Tidak ada langkah tambahan.
+
 ```
 https://wuzapi-6281234567890.<subdomain-akun>.workers.dev/ingest/<INGEST_TOKEN>
 ```
@@ -69,6 +72,32 @@ https://wuzapi-6281234567890.<subdomain-akun>.workers.dev/ingest/<INGEST_TOKEN>
 4. Set `WUZAPI_API_BASE` di `wrangler.jsonc` ke domain publik wuzapi nomor ini
    (HTTPS, tanpa trailing slash) dan deploy ulang. Worker memanggil
    `/chat/send/*` dan `/user/contacts` ke sana.
+
+## 5b. Turso, Telegram, dan pembayaran
+
+Ketiganya opsional untuk menjalankan bot, tetapi dibutuhkan begitu pelanggan
+boleh checkout:
+
+```sh
+export TURSO_DATABASE_URL=libsql://<host-anda>
+export TURSO_AUTH_TOKEN=<token>
+export TELEGRAM_BOT_TOKEN=<token BotFather>
+export TELEGRAM_WEBHOOK_SECRET=<secret acak>
+export ADMIN_API_KEY=<secret acak>
+pnpm run secrets -- --number 6281234567890 --from-env
+pnpm run smoke:turso -- --number 6281234567890 --local-secrets   # verifikasi schema + CRUD
+```
+
+- `TELEGRAM_CHAT_ID` diambil dari balasan bot saat admin menekan `/start`.
+- Daftarkan webhook Telegram ke `https://<worker>/webhooks/telegram` dengan
+  `secret_token` = `TELEGRAM_WEBHOOK_SECRET`.
+- Biarkan `PAYMENT_DRY_RUN=true` (default) sampai kunci Sumopod siap: tautan
+  pembayaran menunjuk `{PUBLIC_BASE_URL}/dry-run/<kode_bayar>` dan tidak ada
+  gateway yang dipanggil. Isi `PUBLIC_BASE_URL` dengan URL worker ini.
+- Tanpa Telegram, approval dikerjakan lewat
+  `POST /admin/orders/<kode>/approve|reject`.
+
+Langkah lengkapnya ada di `../docs/wuzip-bot-runbook.txt` bagian 10-14.
 
 ## 6. Nyalakan bot (shadow dulu, jangan langsung on)
 
@@ -98,7 +127,11 @@ yang belum diisi. Rollback = set `BOT_MODE=off` lalu deploy.
 | `pnpm run migrate -- --number 6281234567890` | terapkan skema D1 (`--local` untuk database lokal) |
 | `pnpm run secrets -- --number 6281234567890` | perbarui secret (`--list`, `--from-env`, `--set`, `--generate`) |
 | `pnpm run provision -- --number 6281234567890` | buat queue/DLQ/bucket/D1/KV (idempoten) |
-| `pnpm run knowledge -- --number 6281234567890` | unggah prompt/knowledge — baru ada di FASE 3 |
+| `pnpm run knowledge -- --number 6281234567890 --prompt <file> --knowledge <file>` | unggah prompt/knowledge (+ `--images <dir>`, + rebuild indeks D1 lewat `--url`) |
+| `pnpm run smoke:turso -- --number 6281234567890 --local-secrets` | uji schema + CRUD Turso (tanpa kredensial: SQLite lokal) |
+| `pnpm run smoke:ai -- --number 6281234567890` | uji endpoint AI |
+| `pnpm run e2e -- --number 6281234567890` | E2E penuh tanpa nomor WA (mock wuzapi/Telegram/AI/Turso) |
+| `curl -H "Authorization: Bearer $ADMIN_API_KEY" https://<worker>/admin/status` | ringkasan Turso/Telegram/outbox |
 
 ## Uji cepat
 
@@ -110,6 +143,12 @@ pnpm run simulate -- --url http://127.0.0.1:8790/ingest/dev-ingest-token-0123456
 
 `.dev.vars` di folder ini sudah berisi nilai dev untuk `INGEST_TOKEN`,
 `WUZAPI_HMAC_KEYS`, dan `DOWNSTREAM_URL` ke `http://127.0.0.1:8799/echo`.
+
+E2E satu perintah (mock wuzapi + Telegram + AI + Turso, tanpa pairing):
+
+```sh
+pnpm run e2e -- --number 6281234567890
+```
 
 Lihat `../README.md` untuk arsitektur, skema pesan, dan pemecahan masalah, serta
 `../docs/wuzip-bot-runbook.txt` untuk prosedur operasional lengkap.

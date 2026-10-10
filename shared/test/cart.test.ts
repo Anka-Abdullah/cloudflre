@@ -232,10 +232,22 @@ describe("executeTool", () => {
     expect((await readCart(db, CHAT, catalog)).lines).toEqual([]);
   });
 
-  it("tells the model that checkout is not available yet, so it cannot promise a link", async () => {
+  it("refuses to check out an empty cart instead of inventing an order", async () => {
     const outcome = await executeTool("create_payment_link", '{"nama":"Budi","alamat":"Jl. Merdeka 1"}', toolContext);
     expect(outcome.failed).toBe(true);
-    expect(outcome.result).toContain("BELUM tersedia");
+    expect(outcome.result).toContain("Keranjang masih kosong");
+  });
+
+  it("refuses a checkout without a database, so it cannot promise a link", async () => {
+    // The FASE 3 behaviour is preserved for the case that matters: with no order
+    // database (Turso not configured / not bound) the tool must say so rather
+    // than let the model promise a payment link.
+    await executeTool("add_to_cart", '{"kode":"116964","qty":1}', toolContext);
+    const outcome = await executeTool("create_payment_link", '{"nama":"Budi","alamat":"Jl. Merdeka 1"}', {
+      ...toolContext,
+      env: { ...toolContext.env, BOT_DB: undefined as unknown as D1Database },
+    });
+    expect(outcome.failed).toBe(true);
     expect(outcome.result).toContain("Jangan menjanjikan link");
   });
 

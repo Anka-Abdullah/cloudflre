@@ -9,14 +9,22 @@
  * Routes:
  *   POST /ingest/<INGEST_TOKEN>  receive one wuzapi webhook and enqueue it
  *   GET  /healthz                liveness + effective configuration (no secrets)
+ *   POST /admin/*                operator surface (bearer ADMIN_API_KEY)
  *
  * Queue consumers (selected by BOT_MODE):
  *   off          <worker>-events → relay to DOWNSTREAM_URL
  *   shadow | on  <worker>-events → bot pipeline (filter, policy, lock, AI, send)
  *   always       <worker>-dlq    → archive failures to R2 and optionally alert
+ *
+ * Scheduled (every minute, see the instance's wrangler.jsonc):
+ *   cron.ts      → outbox flush, order expiry, payment reconcile, contact sync
  */
 export { createWorker } from "./worker";
 export { isDlqQueue, resolveConfig } from "./support";
+export { HISTORY_RETENTION_DAYS, claimIntervalJob, runCronJobs } from "./cron";
+export type { CronDeps, CronOptions, CronResult } from "./cron";
+export { handleAdmin } from "./admin/routes";
+export type { AdminDeps, AdminOptions } from "./admin/routes";
 export { ConfigError, botReadiness, loadConfig } from "./config";
 export type {
   AiToolsMode,
@@ -85,6 +93,8 @@ export {
 export type { ChatStateRow } from "./bot/history";
 export { containsNoAi, namesFromContact, noAiFromContact, resolveChatPolicy, upsertContact } from "./bot/contacts/policy";
 export type { ChatPolicy, ContactRow, PolicyReason } from "./bot/contacts/policy";
+export { isDirectChatJid, syncContacts } from "./bot/contacts/sync";
+export type { ContactSyncOptions, ContactSyncResult } from "./bot/contacts/sync";
 export { deliverOutbound, describeOutbound, RATE_CAPACITY, RATE_REFILL_PER_SECOND } from "./bot/outbound";
 export type { OutboundContext, OutboundOutcome, SendFailure } from "./bot/outbound";
 export {
@@ -148,6 +158,13 @@ export {
   resolveKnowledgeMode,
 } from "./bot/knowledge/loader";
 export type { KnowledgeBundle, KnowledgeSource, LoadKnowledgeOptions } from "./bot/knowledge/loader";
+export { readStored, storageTarget, syncKnowledgeIndex, writeKnowledgeStorage } from "./bot/knowledge/sync";
+export type {
+  KnowledgeStorageInput,
+  KnowledgeStorageResult,
+  SyncIndexOptions,
+  SyncIndexResult,
+} from "./bot/knowledge/sync";
 export {
   NO_CONTEXT_INTRO,
   buildMatchQuery,
@@ -179,3 +196,154 @@ export type {
 } from "./bot/knowledge/catalog";
 export { WuzapiClient } from "./bot/wuzapi/client";
 export type { WuzapiClientDeps, WuzapiClientOptions, WuzapiSendResult } from "./bot/wuzapi/client";
+
+// ---- payment / orders (FASE 5) ---------------------------------------------
+export { PaymentDbError, asNumber, asText, toPaymentDbError, withTursoRetry } from "./bot/payment/sql";
+export type { PaymentDbErrorCode, SqlClient, SqlResult, SqlStatement, SqlValue } from "./bot/payment/sql";
+export { ORDER_STATUS_INITIAL, TURSO_SCHEMA } from "./bot/payment/schema";
+export {
+  ORDER_ACTIVE_STATUSES,
+  ORDER_STATUSES,
+  ORDER_TRANSITIONS,
+  attachPayment,
+  canTransition,
+  createOrder,
+  deleteOrderCascade,
+  ensureOrderItems,
+  ensureTursoSchema,
+  ensureTursoSchemaOnce,
+  findActiveOrderForChat,
+  findCustomerById,
+  findOrderByClientRef,
+  findOrderByKode,
+  findOrderByRef,
+  findPaymentByKodeBayar,
+  findPaymentForOrder,
+  isOrderStatus,
+  isPaymentStatus,
+  listOrderItems,
+  listOrdersDueForExpiry,
+  listOrdersInStatus,
+  listPaymentsForOrder,
+  listTables,
+  resetSchemaCache,
+  supersedeOrder,
+  transitionOrder,
+  updatePayment,
+  upsertCustomer,
+} from "./bot/payment/turso";
+export type {
+  CreateOrderInput,
+  CreateOrderResult,
+  CustomerRow,
+  OrderItemInput,
+  OrderItemRow,
+  OrderPatch,
+  OrderRow,
+  OrderStatus,
+  PaymentPatch,
+  PaymentRow,
+  PaymentStatus,
+  TransitionOrderInput,
+} from "./bot/payment/turso";
+export { createTursoSqlClient, sqlClientFromLibsql, tursoConfigured } from "./bot/payment/libsql-client";
+export type { CreateTursoClientOptions, TursoConnection } from "./bot/payment/libsql-client";
+export {
+  DryRunProvider,
+  MockPaymentProvider,
+  SumopodAdapter,
+  createPaymentProvider,
+  normaliseStatus,
+  parseGenericCallback,
+} from "./bot/payment/provider";
+export type {
+  CallbackStatus,
+  PaymentCallbackPayload,
+  PaymentCustomer,
+  PaymentLinkInput,
+  PaymentLinkResult,
+  PaymentProvider,
+} from "./bot/payment/provider";
+export {
+  approveOrder,
+  computeClientRef,
+  createCheckoutContext,
+  editApprovalCard,
+  ensurePaymentRow,
+  issuePaymentLink,
+  kodeBayarFor,
+  orderCodes,
+  priceItems,
+  queueCustomerMessage,
+  rejectOrder,
+  sendApprovalCard,
+  startCheckout,
+  textsToOutbound,
+} from "./bot/payment/checkout";
+export type {
+  CheckoutContext,
+  CheckoutDeps,
+  CheckoutOutcome,
+  IssuePaymentLinkResult,
+  StartCheckoutInput,
+} from "./bot/payment/checkout";
+export { paymentDeliveryId, outboxTickEnvelope, paymentEnvelope, paymentPayloadOf } from "./bot/payment/events";
+export type { PaymentEventPayload } from "./bot/payment/events";
+export { settlePayment } from "./bot/payment/settle";
+export type { SettleInput, SettleOptions, SettleResult } from "./bot/payment/settle";
+export { handleDryRunAction, handleDryRunPage, handlePaymentCallback, callbackReadiness } from "./bot/payment/routes";
+export type { PaymentRouteDeps, PaymentRouteOptions } from "./bot/payment/routes";
+
+// ---- receipt (FASE 6) -------------------------------------------------------
+export {
+  buildNotaDocument,
+  bytesToBase64,
+  notaFileName,
+  notaNumber,
+  renderNotaPdf,
+  renderNotaText,
+  sanitise,
+} from "./bot/nota/pdf";
+export type { NotaDocument, NotaInput } from "./bot/nota/pdf";
+
+// ---- telegram ---------------------------------------------------------------
+export { TelegramClient } from "./bot/telegram/client";
+export type {
+  SendMessageOptions,
+  TelegramClientDeps,
+  TelegramClientOptions,
+  TelegramInlineButton,
+  TelegramReplyMarkup,
+  TelegramResult,
+} from "./bot/telegram/client";
+export {
+  approvalKeyboard,
+  callbackData,
+  parseCallbackData,
+  parseFeeAmount,
+  renderApprovalCard,
+  renderDecidedCard,
+  renderFeePrompt,
+} from "./bot/telegram/cards";
+export type { CardAction, CardInput } from "./bot/telegram/cards";
+export { consumePending, findPending, prunePending, rememberPending } from "./bot/telegram/pending";
+export type { PendingKind, PendingRow } from "./bot/telegram/pending";
+export { handleTelegramWebhook } from "./bot/telegram/webhook";
+export type { TelegramWebhookDeps, TelegramWebhookOptions } from "./bot/telegram/webhook";
+
+// ---- outbox (FASE 5/6) ------------------------------------------------------
+export { claimOutboxRows, enqueueOutbox, listOutboxForOrder, markOutboxFailed, markOutboxRetry, markOutboxSent, outboxStats, parseOutboxMessage } from "./bot/outbox/store";
+export type { EnqueueInput, OutboxKind, OutboxRow, OutboxStats, OutboxStatus } from "./bot/outbox/store";
+export { flushOutbox, outboxMessageId } from "./bot/outbox/flush";
+export type { FlushOptions, FlushResult } from "./bot/outbox/flush";
+
+// ---- customer-facing payment texts ------------------------------------------
+export {
+  awaitingApprovalMessage,
+  expiredMessage,
+  failedMessage,
+  notaCaption,
+  paidMessage,
+  paymentLinkMessage,
+  rejectedMessage,
+} from "./bot/payment/messages";
