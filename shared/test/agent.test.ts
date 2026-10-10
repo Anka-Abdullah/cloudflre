@@ -12,6 +12,7 @@ import { env } from "cloudflare:workers";
 import { LlmClient, type LlmMessage } from "../src/bot/agent/llm";
 import { runAgentLoop, type AgentTurnInput } from "../src/bot/agent/run";
 import { TOOL_DEFINITIONS, type ToolOutcome } from "../src/bot/agent/tools";
+import { parseJsonAction, renderJsonModeInstructions } from "../src/bot/agent/prompt";
 import { createLogger } from "../src/lib/logger";
 import type { InboundMessage } from "../src/bot/types";
 
@@ -351,5 +352,162 @@ describe("LlmClient", () => {
     const result = await bare.chat([{ role: "user", content: "halo" }]);
     expect(result.ok).toBe(false);
     expect(result.error).not.toContain("Illegal invocation");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JSON mode (work order: "Fallback JSON mode disiapkan, bukan mode utama")
+// ---------------------------------------------------------------------------
+
+describe("parseJsonAction", () => {
+  it("reads a reply action", () => {
+    expect(parseJsonAction('{"action":"reply","text":"Halo kak"}')).toEqual({ kind: "reply", text: "Halo kak" });
+  });
+
+  it("reads a tool action with its arguments", () => {
+    expect(parseJsonAction('{"action":"tool","tool":"add_to_cart","arguments":{"kode":"116964","qty":2}}')).toEqual({
+      kind: "tool",
+      tool: "add_to_cart",
+      arguments: { kode: "116964", qty: 2 },
+    });
+  });
+
+  it("unwraps a ```json fence the model adds anyway", () => {
+    expect(parseJsonAction('```json\n{"action":"reply","text":"Ya"}\n```')).toEqual({ kind: "reply", text: "Ya" });
+    expect(parseJsonAction('```\n{"action":"reply","text":"Ya"}\n```')).toEqual({ kind: "reply", text: "Ya" });
+  });
+
+  it("infers the action when the model omits it", () => {
+    expect(parseJsonAction('{"tool":"view_cart","arguments":{}}')).toEqual({ kind: "tool", tool: "view_cart", arguments: {} });
+    expect(parseJsonAction('{"text":"Halo"}')).toEqual({ kind: "reply", text: "Halo" });
+  });
+
+  it("uses a plain-text answer as the reply rather than discarding it", () => {
+    // A model that ignores the protocol but answers the customer should not have
+    // its answer thrown away for being off-format.
+    expect(parseJsonAction("Halo kak, jaketnya ada.")).toEqual({ kind: "reply", text: "Halo kak, jaketnya ada." });
+  });
+
+  it("returns null when there is nothing usable", () => {
+    expect(parseJsonAction("")).toBeNull();
+    expect(parseJsonAction("   ")).toBeNull();
+    expect(parseJsonAction('{"action":"tool","tool":""}')).toBeNull();
+    expect(parseJsonAction('{"action":"tool","arguments":{}}')).toBeNull();
+  });
+
+  it("defaults missing arguments to an empty object", () => {
+    expect(parseJsonAction('{"action":"tool","tool":"view_cart"}')).toEqual({ kind: "tool", tool: "view_cart", arguments: {} });
+  });
+});
+
+describe("renderJsonModeInstructions", () => {
+  it("lists every tool and both response shapes", () => {
+    const text = renderJsonModeInstructions([{ name: "view_cart", description: "Lihat keranjang" }]);
+    expect(text).toContain("view_cart");
+    expect(text).toContain('"action":"tool"');
+    expect(text).toContain('"action":"reply"');
+  });
+});
+
+describe("runAgentLoop in JSON mode", () => {
+  it("does not send a tools array and answers from a reply action", async () => {
+    const { fetchImpl, requests } = scriptedModel([textResponse('{"action":"reply","text":"Jaketnya ada kak."}')]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), { maxTurns: 3, mode: "json", execute: noTools });
+
+    expect(outcome.text).toBe("Jaketnya ada kak.");
+    expect(outcome.reason).toBe("agent_json");
+    expect(requests[0]?.hasTools).toBe(false);
+    // The contract reaches the model through the system prompt instead.
+    const system = requests[0]?.messages.find((entry) => entry.role === "system");
+    expect(String(system?.content)).toContain('"action":"tool"');
+  });
+
+  it("executes a tool action and uses the follow-up reply", async () => {
+    const { fetchImpl, requests } = scriptedModel([
+      textResponse('{"action":"tool","tool":"view_cart","arguments":{}}'),
+      textResponse('{"action":"reply","text":"Keranjangnya kosong kak."}'),
+    ]);
+    const seen: string[] = [];
+    const outcome = await runAgentLoop(turnInput(fetchImpl), {
+      maxTurns: 3,
+      mode: "json",
+      execute: async (name) => {
+        seen.push(name);
+        return { result: "Isi keranjang: (kosong)", outbound: [], failed: false };
+      },
+    });
+
+    expect(seen).toEqual(["view_cart"]);
+    expect(outcome.text).toBe("Keranjangnya kosong kak.");
+    expect(outcome.toolCalls).toBe(1);
+    // The tool result is handed back as a user turn: JSON mode has no tool role.
+    expect(requests[1]?.messages.at(-1)).toMatchObject({ role: "user" });
+    expect(String(requests[1]?.messages.at(-1)?.content)).toContain("HASIL TOOL view_cart");
+  });
+
+  it("collects outbound produced by a tool", async () => {
+    const { fetchImpl } = scriptedModel([
+      textResponse('{"action":"tool","tool":"send_image","arguments":{"name":"a.jpg"}}'),
+      textResponse('{"action":"reply","text":"Fotonya sudah aku kirim."}'),
+    ]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), {
+      maxTurns: 3,
+      mode: "json",
+      execute: async () => ({ result: "terkirim", outbound: [{ kind: "image", image: "B64", caption: "Foto" }], failed: false }),
+    });
+    expect(outcome.outbound).toHaveLength(1);
+    expect(outcome.text).toContain("Fotonya");
+  });
+
+  it("refuses a tool call on the last turn and falls back", async () => {
+    const { fetchImpl } = scriptedModel([
+      textResponse('{"action":"tool","tool":"view_cart","arguments":{}}'),
+      textResponse('{"action":"tool","tool":"view_cart","arguments":{}}'),
+    ]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), { maxTurns: 2, mode: "json", execute: noTools });
+    expect(outcome.text).toBe("");
+    expect(outcome.reason).toBe("fallback_max_turns");
+  });
+
+  it("reports an unparsable answer instead of sending it", async () => {
+    const { fetchImpl } = scriptedModel([textResponse('{"action":"menari"}')]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), { maxTurns: 3, mode: "json", execute: noTools });
+    expect(outcome.text).toBe("");
+    expect(outcome.reason).toBe("fallback_json_unparsable");
+  });
+
+  it("switches to JSON mode when the endpoint refuses the tools array", async () => {
+    const { fetchImpl, requests } = scriptedModel([
+      // An endpoint that does not implement native tools.
+      new Response(JSON.stringify({ error: "tools is not supported" }), { status: 400 }),
+      textResponse('{"action":"reply","text":"Pakai mode JSON."}'),
+    ]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), {
+      maxTurns: 3,
+      mode: "native",
+      jsonFallback: true,
+      execute: noTools,
+    });
+
+    expect(outcome.text).toBe("Pakai mode JSON.");
+    expect(outcome.reason).toBe("agent_json_fallback");
+    expect(requests[0]?.hasTools).toBe(true);
+    expect(requests[1]?.hasTools).toBe(false);
+  });
+
+  it("does not switch modes when the fallback is disabled", async () => {
+    const { fetchImpl, requests } = scriptedModel([
+      new Response(JSON.stringify({ error: "tools is not supported" }), { status: 400 }),
+    ]);
+    const outcome = await runAgentLoop(turnInput(fetchImpl), {
+      maxTurns: 3,
+      mode: "native",
+      jsonFallback: false,
+      execute: noTools,
+    });
+
+    expect(outcome.text).toBe("");
+    expect(outcome.reason).toBe("fallback_ai_error");
+    expect(requests).toHaveLength(1);
   });
 });

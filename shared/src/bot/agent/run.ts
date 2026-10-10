@@ -30,7 +30,7 @@ import { retrieve, type KnowledgeHit } from "../knowledge/search";
 import { readCart, cartToPrompt } from "../sales/cart.service";
 import type { InboundMessage, OutboundMessage, ReplyContext } from "../types";
 import { LlmClient, type LlmMessage } from "./llm";
-import { buildSystemPrompt, checkForbidden } from "./prompt";
+import { buildSystemPrompt, checkForbidden, parseJsonAction, renderJsonModeInstructions } from "./prompt";
 import { executeTool, TOOL_DEFINITIONS, type ToolContext } from "./tools";
 
 export interface ReplyPlan {
@@ -128,8 +128,13 @@ export interface AgentTurnInput {
   cartText: string;
 }
 
-/** Conversation starter for the model: system prompt, then the customer message. */
-export function buildMessages(input: AgentTurnInput): LlmMessage[] {
+/**
+ * Conversation starter for the model: system prompt, then the customer message.
+ *
+ * In JSON mode the response contract is appended to the system prompt, because
+ * without a `tools` array the model has no other way to learn it.
+ */
+export function buildMessages(input: AgentTurnInput, jsonMode = false): LlmMessage[] {
   const system = buildSystemPrompt({
     botPrompt: input.botPrompt,
     now: input.now,
@@ -142,14 +147,26 @@ export function buildMessages(input: AgentTurnInput): LlmMessage[] {
     noContext: input.noContext,
   });
 
+  const instructions = jsonMode
+    ? renderJsonModeInstructions(TOOL_DEFINITIONS.map((tool) => ({ name: tool.function.name, description: tool.function.description })))
+    : "";
+
   return [
-    { role: "system", content: system },
+    { role: "system", content: instructions === "" ? system : `${system}\n\n${instructions}` },
     { role: "user", content: input.message.body },
   ];
 }
 
 export interface AgentLoopOptions {
   maxTurns: number;
+  /** `native` sends a tools array; `json` describes the tools in the prompt. */
+  mode?: "native" | "json";
+  /**
+   * When a native call fails with a non-retryable error on the first turn, retry
+   * the whole turn in JSON mode. Some OpenAI-compatible endpoints answer 400 to a
+   * `tools` array they do not implement, and that must not take the bot down.
+   */
+  jsonFallback?: boolean;
   /** Test seam: replaces the real tool execution. */
   execute?: typeof executeTool;
 }
@@ -163,28 +180,92 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<{ text: string; outbound: OutboundMessage[]; reason: string; toolCalls: number }> {
   const { log, config, message } = input;
-  const messages = buildMessages(input);
   const outbound: OutboundMessage[] = [];
-  let toolCalls = 0;
+  const toolContext: ToolContext = {
+    env: input.env,
+    config,
+    chatJid: message.chatJid,
+    catalog: input.catalog,
+    now: input.now,
+    log,
+  };
+  const run = options.execute ?? executeTool;
   const turnLimit = Math.max(1, options.maxTurns);
 
-  for (let turn = 1; turn <= turnLimit; turn++) {
+  let mode: "native" | "json" = options.mode ?? "native";
+  let messages = buildMessages(input, mode === "json");
+  let usedJsonFallback = false;
+  let toolCalls = 0;
+  let turn = 0;
+
+  while (turn < turnLimit) {
+    turn += 1;
     const isLastTurn = turn === turnLimit;
-    const result = await input.llm.chat(messages, isLastTurn ? undefined : TOOL_DEFINITIONS);
+    // Native mode stops offering tools on the final turn, so the model must
+    // answer in prose. JSON mode has no tools parameter, so it is told instead.
+    const offerTools = mode === "native" && !isLastTurn;
+    const result = await input.llm.chat(messages, offerTools ? TOOL_DEFINITIONS : undefined);
 
     if (!result.ok || !result.message) {
       log.error("ai_call_unusable", {
         chatJid: message.chatJid,
         turn,
+        mode,
         error: result.error,
         finishReason: result.finishReason,
       });
-      return { text: "", outbound, reason: turn === 1 ? "fallback_ai_error" : "fallback_ai_error_midturn", toolCalls };
+      // An endpoint that rejects the tools array is a capability problem, not an
+      // outage: retry the conversation in JSON mode with a fresh turn budget.
+      if (mode === "native" && options.jsonFallback === true && !usedJsonFallback) {
+        usedJsonFallback = true;
+        mode = "json";
+        messages = buildMessages(input, true);
+        turn = 0;
+        log.warn("ai_json_fallback", { chatJid: message.chatJid, reason: result.error });
+        continue;
+      }
+      return {
+        text: "",
+        outbound,
+        reason: usedJsonFallback
+          ? "fallback_json_error"
+          : turn === 1
+            ? "fallback_ai_error"
+            : "fallback_ai_error_midturn",
+        toolCalls,
+      };
     }
 
     const assistant = result.message;
-    const calls = assistant.tool_calls ?? [];
 
+    if (mode === "json") {
+      const action = parseJsonAction(assistant.content ?? "");
+      if (!action) {
+        log.error("ai_json_unparsable", { chatJid: message.chatJid, turn });
+        return { text: "", outbound, reason: "fallback_json_unparsable", toolCalls };
+      }
+      if (action.kind === "reply") {
+        return { text: action.text, outbound, reason: usedJsonFallback ? "agent_json_fallback" : "agent_json", toolCalls };
+      }
+      if (isLastTurn) {
+        log.warn("ai_json_tool_on_last_turn", { chatJid: message.chatJid, tool: action.tool });
+        return { text: "", outbound, reason: "fallback_max_turns", toolCalls };
+      }
+
+      toolCalls += 1;
+      // Echo the model's own JSON so the next turn can see what it asked for,
+      // then hand back the result as a user turn (there is no tool role here).
+      messages.push({ role: "assistant", content: assistant.content ?? "" });
+      const outcome = await run(action.tool, JSON.stringify(action.arguments), toolContext);
+      if (outcome.outbound.length > 0) outbound.push(...outcome.outbound);
+      messages.push({
+        role: "user",
+        content: `HASIL TOOL ${action.tool}:\n${outcome.result}\n\nLanjutkan. Balas HANYA dengan satu objek JSON.`,
+      });
+      continue;
+    }
+
+    const calls = assistant.tool_calls ?? [];
     if (calls.length === 0) {
       const text = (assistant.content ?? "").trim();
       if (text === "") {
@@ -198,16 +279,6 @@ export async function runAgentLoop(
     // cart update and an image in one turn, and skipping one leaves it waiting for
     // a result that never arrives.
     messages.push(assistant);
-    const toolContext: ToolContext = {
-      env: input.env,
-      config,
-      chatJid: message.chatJid,
-      catalog: input.catalog,
-      now: input.now,
-      log,
-    };
-    const run = options.execute ?? executeTool;
-
     for (const call of calls) {
       toolCalls += 1;
       const outcome = await run(call.name, call.arguments, toolContext);
@@ -278,7 +349,11 @@ export function createResponder(options: AgentOptions): Responder {
           noContext: retrieval.intro !== "",
           cartText,
         },
-        { maxTurns: config.bot.aiMaxTurns },
+        {
+          maxTurns: config.bot.aiMaxTurns,
+          mode: config.bot.aiToolsMode,
+          jsonFallback: config.bot.aiJsonFallback,
+        },
       );
 
       if (outcome.text === "") {

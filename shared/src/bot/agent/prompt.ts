@@ -128,3 +128,90 @@ export function describeProduct(product: ResolvedProduct): string {
   const ongkir = product.ongkirIncluded ? "ongkir sudah termasuk" : "ongkir belum termasuk (perlu konfirmasi admin)";
   return `${product.nama} (${product.kode}) — ${formatRupiah(product.harga)}, ${ongkir}`;
 }
+
+// ---------------------------------------------------------------------------
+// JSON mode: the fallback protocol used when the endpoint cannot do native tool
+// calling (work plan risk R1), or when AI_TOOLS_MODE=json.
+//
+// Without a `tools` array the model has to be told, in prose, what it may do and
+// what shape its answer must take. The protocol is deliberately tiny — one action
+// per turn, either a reply or a single tool call — because a model that has to
+// produce nested JSON reliably does better with a small grammar.
+// ---------------------------------------------------------------------------
+
+export interface JsonModeTool {
+  name: string;
+  description: string;
+}
+
+/** The response contract, appended to the system prompt in JSON mode. */
+export function renderJsonModeInstructions(tools: readonly JsonModeTool[]): string {
+  const catalog = tools.map((tool) => `- ${tool.name}: ${tool.description}`).join("\n");
+  return [
+    "CARA MENJAWAB (WAJIB):",
+    "Balas HANYA dengan satu objek JSON, tanpa teks lain di luar JSON, tanpa pagar kode.",
+    "",
+    "Kalau perlu memakai tool:",
+    '  {"action":"tool","tool":"<nama tool>","arguments":{...}}',
+    "Kalau sudah bisa menjawab pelanggan:",
+    '  {"action":"reply","text":"<balasan untuk pelanggan>"}',
+    "",
+    "TOOL YANG TERSEDIA:",
+    catalog,
+    "",
+    "Aturan: satu tool per balasan. Setelah tool dijalankan kamu akan menerima hasilnya,",
+    "lalu balas lagi dengan JSON. Harga tetap hanya boleh dari katalog atau hasil tool.",
+  ].join("\n");
+}
+
+export type JsonAction =
+  | { kind: "reply"; text: string }
+  | { kind: "tool"; tool: string; arguments: Record<string, unknown> };
+
+/** Strips a ```json fence (and a bare ``` fence) that models like to add anyway. */
+function stripFence(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  return (fenced?.[1] ?? trimmed).trim();
+}
+
+/**
+ * Reads one action out of a JSON-mode answer.
+ *
+ * Tolerant on purpose: it accepts a fenced block, an object without an explicit
+ * `action`, and — when the text is not JSON at all — falls back to treating the
+ * answer as prose. That last case matters: a model that ignores the protocol and
+ * answers the customer directly should have its answer used, not discarded for
+ * being off-format.
+ */
+export function parseJsonAction(content: string): JsonAction | null {
+  const text = stripFence(content);
+  if (text === "") return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: "reply", text };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return typeof parsed === "string" ? { kind: "reply", text: parsed } : null;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const action = typeof record["action"] === "string" ? record["action"].toLowerCase() : "";
+  const tool = typeof record["tool"] === "string" ? record["tool"].trim() : "";
+  const reply = typeof record["text"] === "string" ? record["text"].trim() : "";
+
+  if (action === "tool" || (action === "" && tool !== "")) {
+    if (tool === "") return null;
+    const args = record["arguments"];
+    const arguments_ =
+      typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+    return { kind: "tool", tool, arguments: arguments_ };
+  }
+  if (action === "reply" || (action === "" && reply !== "")) {
+    return reply === "" ? null : { kind: "reply", text: reply };
+  }
+  return null;
+}
