@@ -163,6 +163,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM outbox"),
     db.prepare("DELETE FROM processed_events"),
+    db.prepare("DELETE FROM reply_parts"),
     db.prepare("DELETE FROM telegram_pending"),
     db.prepare("DELETE FROM messages"),
   ]);

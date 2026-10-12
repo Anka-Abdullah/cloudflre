@@ -21,6 +21,7 @@ const CHAT = "628111@s.whatsapp.net";
 beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM processed_events"),
+    db.prepare("DELETE FROM reply_parts"),
     db.prepare("DELETE FROM messages"),
     db.prepare("DELETE FROM contacts"),
     db.prepare("DELETE FROM suppressed_chats"),

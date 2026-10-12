@@ -34,7 +34,8 @@ import {
   recordOutbound,
   touchOutbound,
 } from "../history";
-import { deliverOutbound } from "../outbound";
+import { deliverOutbound, deliverReplyPlan } from "../outbound";
+import { countReplyParts, loadReplyPlan, saveReplyPlan, type StoredReplyPlan } from "../reply-plan";
 import { createResponder, type Responder } from "../agent/run";
 import type { ChatMessage, InboundMessage, OutboundMessage, ReplyContext } from "../types";
 import { WuzapiClient } from "../wuzapi/client";
@@ -276,13 +277,34 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
       now: at,
     };
 
-    const plan = await runtime.responder(context);
+    // The reply plan is read back from D1 *before* the model is consulted. On a
+    // queue retry this is what makes the attempt continue the same reply instead
+    // of starting a second one: the same messages, the same message ids, and no
+    // second AI call (WP-2B).
+    let replyPlan = await loadReplyPlan(db, envelope.deliveryId);
+    let planReason: string;
+    if (replyPlan) {
+      const counts = countReplyParts(replyPlan.parts);
+      planReason = "replayed";
+      log.info("reply_plan_replayed", {
+        deliveryId: envelope.deliveryId,
+        chatJid: message.chatJid,
+        parts: replyPlan.parts.length,
+        sent: counts.sent,
+        pending: counts.pending,
+        failed: counts.failed,
+      });
+    } else {
+      const decision = await runtime.responder(context);
+      replyPlan = await saveReplyPlan(db, envelope.deliveryId, message.chatJid, decision.messages);
+      planReason = decision.reason;
+    }
 
     // The typing bubble covers the model's thinking time. It is best-effort: a
     // wuzapi that refuses presence must not stop the answer itself.
     await setTyping(runtime, message.chatJid, "composing");
 
-    const outbound = await deliverOutbound(
+    const outbound = await deliverReplyPlan(
       {
         env: runtime.env,
         config,
@@ -290,51 +312,73 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
         log,
         deliver,
         sleep: runtime.sleep,
+        db,
+        deliveryId: envelope.deliveryId,
+        now: runtime.now,
       },
       message.chatJid,
-      plan.messages,
+      replyPlan,
     );
     await setTyping(runtime, message.chatJid, "paused");
 
+    if (outbound.suppressed) {
+      // Shadow mode: nothing left the worker, so there is no progress to keep.
+      // The delivery still settles `done`, which is the pre-existing contract.
+      await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid);
+      log.info("event_done", {
+        deliveryId: envelope.deliveryId,
+        chatJid: message.chatJid,
+        replies: replyPlan.messages.length,
+        reason: planReason,
+        shadow: true,
+      });
+      return { action: "ack" };
+    }
+
+    // Only the parts that succeeded *in this pass* become history, so a resumed
+    // reply cannot write the same outbound bubble twice.
+    await recordSentParts(db, message.chatJid, replyPlan, outbound.sentIndexes, at.getTime());
+    if (outbound.sentIndexes.length > 0) await touchOutbound(db, message.chatJid, at.getTime());
+
     if (outbound.failures.length > 0) {
-      const permanent = outbound.failures.every((failure) => failure.permanent);
       log.error("outbound_incomplete", {
         deliveryId: envelope.deliveryId,
         chatJid: message.chatJid,
-        sent: outbound.sent,
-        failed: outbound.failures.length,
-        permanent,
+        sent: outbound.sentIndexes.length,
+        pending: outbound.pendingIndexes.length,
+        failed: outbound.failedIndexes.length,
       });
-      if (permanent) {
-        // wuzapi answered 4xx: the same call cannot succeed, so retrying the
-        // queue message would only burn attempts. Ack it, but release the chat
-        // lock — holding it would block the customer's next real message for the
-        // whole lock TTL.
-        log.error("outbound_permanent", {
-          deliveryId: envelope.deliveryId,
-          chatJid: message.chatJid,
-          error: outbound.failures[0]?.error ?? "unknown",
-        });
-        await settle(runtime, envelope.deliveryId, "failed", "outbound permanently rejected", message.chatJid);
-        return { action: "ack", reason: "outbound_permanent" };
-      }
-      await finishDelivery(db, envelope.deliveryId, "failed", at.getTime(), "outbound failed");
+    }
+
+    if (outbound.pendingIndexes.length > 0) {
+      // A transient failure (5xx, timeout, empty bucket): the queue retry picks
+      // up exactly the parts still pending, under their original message ids.
+      await finishDelivery(db, envelope.deliveryId, "failed", at.getTime(), "outbound incomplete");
       await releaseChat(runtime.env, message.chatJid, {});
       return { action: "retry", delaySeconds: 15 };
     }
 
-    if (!outbound.suppressed) {
-      for (const sentMessage of plan.messages) await recordSent(db, message.chatJid, sentMessage, at.getTime());
-      await touchOutbound(db, message.chatJid, at.getTime());
+    if (outbound.failedIndexes.length > 0) {
+      // Every remaining part was a 4xx, so the same calls cannot succeed.
+      // Acking is deliberate: the queue must not burn its attempts on them, and
+      // the parts that did arrive are already recorded above.
+      log.error("outbound_permanent", {
+        deliveryId: envelope.deliveryId,
+        chatJid: message.chatJid,
+        failed: outbound.failedIndexes.length,
+        error: outbound.failures[0]?.error ?? "unknown",
+      });
+      await settle(runtime, envelope.deliveryId, "failed", "outbound permanently rejected", message.chatJid);
+      return { action: "ack", reason: "outbound_permanent" };
     }
 
     await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid);
     log.info("event_done", {
       deliveryId: envelope.deliveryId,
       chatJid: message.chatJid,
-      replies: plan.messages.length,
-      reason: plan.reason,
-      shadow: outbound.suppressed,
+      replies: replyPlan.messages.length,
+      reason: planReason,
+      shadow: false,
     });
     return { action: "ack" };
   } catch (error) {
@@ -386,6 +430,26 @@ async function recordSent(
     message.kind === "text" ? message.body : message.kind === "image" ? message.caption : (message.caption ?? message.fileName);
   const kind = message.kind === "text" ? "text" : "caption";
   await recordOutbound(db, { chatJid, body, kind, at });
+}
+
+/**
+ * Writes history for the parts that reached WhatsApp in this pass.
+ *
+ * Deliberately driven by the *newly sent* indexes rather than by every message in
+ * the plan: on a resumed reply the earlier parts were recorded by the attempt that
+ * sent them, and writing them again would show the model its own answer twice.
+ */
+async function recordSentParts(
+  db: D1Database,
+  chatJid: string,
+  plan: StoredReplyPlan,
+  indexes: readonly number[],
+  at: number,
+): Promise<void> {
+  for (const index of indexes) {
+    const message = plan.messages[index];
+    if (message) await recordSent(db, chatJid, message, at);
+  }
 }
 
 function safeJson(value: unknown): string | null {

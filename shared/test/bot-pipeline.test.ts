@@ -16,7 +16,7 @@ import { loadConfig, type Env, type InstanceConfig } from "../src/config";
 import { ENVELOPE_VERSION, type EnvelopeV1 } from "../src/envelope";
 import { handleBotBatch } from "../src/bot/queue/router";
 import { claimChat, releaseChat } from "../src/bot/coordinator/chat-lock";
-import type { ReplyContext } from "../src/bot/types";
+import type { OutboundMessage, ReplyContext } from "../src/bot/types";
 
 // The schema comes from shared/test/setup.ts.
 const db = (env as unknown as { BOT_DB: D1Database }).BOT_DB;
@@ -33,6 +33,7 @@ function configFor(scenarioEnv: Env, mode: "off" | "shadow" | "on" = "on"): Inst
 beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM processed_events"),
+    db.prepare("DELETE FROM reply_parts"),
     db.prepare("DELETE FROM messages"),
     db.prepare("DELETE FROM contacts"),
     db.prepare("DELETE FROM suppressed_chats"),
@@ -90,13 +91,21 @@ interface Harness {
   presence: { url: string; method: string; token: string | null; body: Record<string, unknown> }[];
   logs: string[];
   contexts: ReplyContext[];
+  /** How many times the model was consulted; the WP-2B tests assert it is 1. */
+  responderCalls: number;
 }
 
 interface RunOptions {
   mode?: "off" | "shadow" | "on";
-  /** Overrides the WuzAPI response; return a 503 to simulate an outage. */
-  responder?: (url: string, attempt: number) => Response;
+  /**
+   * Overrides the WuzAPI response for a send. Receives the request body so a
+   * test can fail one specific bubble: the WuzapiClient has its own 4-step retry
+   * ladder, so counting calls here would fight it.
+   */
+  responder?: (url: string, body: Record<string, unknown>, attempt: number) => Response;
   reply?: string;
+  /** A multi-part reply, so a test can interrupt it between two bubbles. */
+  replyMessages?: OutboundMessage[];
   /** Simulates a missing secret or binding for this run only. */
   envOverrides?: Record<string, unknown>;
 }
@@ -105,7 +114,7 @@ async function run(
   envelopes: EnvelopeV1[],
   options: RunOptions = {},
 ): Promise<{ harness: Harness; result: Awaited<ReturnType<typeof getQueueResult>> }> {
-  const harness: Harness = { calls: [], sends: [], presence: [], logs: [], contexts: [] };
+  const harness: Harness = { calls: [], sends: [], presence: [], logs: [], contexts: [], responderCalls: 0 };
 
   const batch = createMessageBatch(
     "wuzip-shared-test-events",
@@ -133,7 +142,11 @@ async function run(
       },
       responder: async (context) => {
         harness.contexts.push(context);
-        return { messages: [{ kind: "text", body: options.reply ?? "Halo, ada yang bisa dibantu?" }], reason: "test" };
+        harness.responderCalls += 1;
+        return {
+          messages: options.replyMessages ?? [{ kind: "text", body: options.reply ?? "Halo, ada yang bisa dibantu?" }],
+          reason: "test",
+        };
       },
       sendDlq: async () => {},
       fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -147,7 +160,9 @@ async function run(
 
         // The simulated outage/rejection applies to sends only: the typing
         // indicator is best-effort and must not change what these tests assert.
-        if (options.responder && url.includes("/chat/send/")) return options.responder(url, harness.sends.length);
+        if (options.responder && url.includes("/chat/send/")) {
+          return options.responder(url, body, harness.sends.length);
+        }
         return new Response(JSON.stringify({ code: 200, success: true, data: { Id: "WA-OUT-1" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -157,6 +172,19 @@ async function run(
   });
 
   return { harness, result: await getQueueResult(batch, ctx) };
+}
+
+/** The `Id` wuzapi was asked to use for each send, in order. */
+function sentIds(harness: Harness): unknown[] {
+  return harness.sends.map((call) => call.body["Id"]);
+}
+
+/** The outbound ("out") rows in the conversation history. */
+async function outboundBodies(): Promise<string[]> {
+  const rows = await db
+    .prepare("SELECT body FROM messages WHERE direction = 'out' ORDER BY rowid")
+    .all<{ body: string }>();
+  return rows.results.map((row) => row.body);
 }
 
 async function countMessages(): Promise<number> {
@@ -411,6 +439,135 @@ describe("outbound failures", () => {
     const next = await run([buildEnvelope("d-after-permanent", CHAT, { conversation: "halo lagi" })]);
     expect(next.result.explicitAcks).toEqual(["message-1"]);
     expect(next.harness.sends).toHaveLength(1);
+  });
+});
+
+/**
+ * WP-2B — one delivery must produce one reply, even across a crash.
+ *
+ * Each test below re-runs the *same* delivery id through the real router with a
+ * fresh batch, which is exactly what Cloudflare Queues does after a retry. The
+ * faults injected are the three that used to duplicate a customer's answer:
+ * a 5xx in the middle of a multi-part reply, a send that succeeded before the
+ * worker died, and an interrupted attempt that already answered.
+ */
+describe("reply plan idempotency (WP-2B)", () => {
+  const PARTS: OutboundMessage[] = [
+    { kind: "text", body: "Bagian satu" },
+    { kind: "text", body: "Bagian dua" },
+    { kind: "text", body: "Bagian tiga" },
+  ];
+
+  it("does not replay the AI or re-send a bubble that already went out", async () => {
+    // "Bagian dua" fails with a 503 on every internal attempt the client makes,
+    // so the reply stops between part 1 and part 3.
+    const first = await run([buildEnvelope("d-plan-1", CHAT, { conversation: "halo" })], {
+      replyMessages: PARTS,
+      responder: (_url, body) =>
+        body["Body"] === "Bagian dua"
+          ? new Response(JSON.stringify({ code: 503, success: false, error: "unavailable" }), { status: 503 })
+          : new Response(JSON.stringify({ code: 200, success: true, data: { Id: "WA-OK" } }), { status: 200 }),
+    });
+
+    expect(first.harness.responderCalls).toBe(1);
+    // Part 1 landed, part 2 exhausted the client's ladder, part 3 was never
+    // attempted (the loop stops at the first still-pending part).
+    expect(first.harness.sends.length).toBeGreaterThanOrEqual(5);
+    expect(first.harness.sends.at(-1)?.body["Body"]).toBe("Bagian dua");
+    expect(first.result.retryMessages.map((entry) => entry.msgId)).toEqual(["message-1"]);
+
+    // The retry must NOT call the model again: the plan is read back from D1.
+    const retry = await run([buildEnvelope("d-plan-1", CHAT, { conversation: "halo" })], {
+      replyMessages: PARTS,
+    });
+
+    expect(retry.harness.responderCalls).toBe(0);
+    // Only the parts that never landed are re-sent — not part 1 again.
+    expect(retry.harness.sends.map((call) => call.body["Body"])).toEqual(["Bagian dua", "Bagian tiga"]);
+    expect(retry.result.explicitAcks).toEqual(["message-1"]);
+    expect(retry.harness.logs).toContain("info:reply_plan_replayed");
+
+    // History holds each bubble exactly once, in order.
+    expect(await outboundBodies()).toEqual(["Bagian satu", "Bagian dua", "Bagian tiga"]);
+  });
+
+  it("uses the same message id for every part on every attempt", async () => {
+    const first = await run([buildEnvelope("d-plan-stable", CHAT, { conversation: "halo" })], {
+      replyMessages: PARTS,
+    });
+    const ids = sentIds(first.harness);
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+
+    // A redelivery after the fact is dropped by the `done` ledger before it can
+    // send anything at all — that is the second layer of the same guarantee.
+    const again = await run([buildEnvelope("d-plan-stable", CHAT, { conversation: "halo" })], {
+      replyMessages: PARTS,
+    });
+    expect(again.harness.responderCalls).toBe(0);
+    expect(again.harness.sends).toHaveLength(0);
+    expect(again.result.explicitAcks).toEqual(["message-1"]);
+    expect(await outboundBodies()).toEqual(["Bagian satu", "Bagian dua", "Bagian tiga"]);
+  });
+
+  it("re-sends under the original id when the worker died after the send", async () => {
+    // Simulates "wuzapi accepted the send, then the worker was evicted before
+    // markReplyPartSent ran": the ledger still says pending, so the part is
+    // re-sent — under the same id, which is what makes it safe.
+    const interrupted = await run([buildEnvelope("d-plan-crash", CHAT, { conversation: "halo" })], {
+      replyMessages: [{ kind: "text", body: "Halo" }],
+      responder: () => new Response(JSON.stringify({ code: 503, success: false, error: "down" }), { status: 503 }),
+    });
+    expect(interrupted.harness.responderCalls).toBe(1);
+
+    const status = await db
+      .prepare("SELECT status FROM reply_parts WHERE delivery_id = 'd-plan-crash' AND part_index = 0")
+      .first<{ status: string }>();
+    expect(status?.status).toBe("pending");
+
+    const retry = await run([buildEnvelope("d-plan-crash", CHAT, { conversation: "halo" })]);
+    expect(retry.harness.responderCalls).toBe(0);
+    expect(retry.harness.sends).toHaveLength(1);
+    expect(sentIds(retry.harness)[0]).toBe(sentIds(interrupted.harness)[0]);
+  });
+
+  it("parks a permanently rejected part and does not retry the whole reply", async () => {
+    const first = await run([buildEnvelope("d-plan-4xx", CHAT, { conversation: "halo" })], {
+      replyMessages: PARTS,
+      responder: (_url, body) =>
+        body["Body"] === "Bagian satu"
+          ? new Response(JSON.stringify({ code: 400, success: false, error: "bad payload" }), { status: 400 })
+          : new Response(JSON.stringify({ code: 200, success: true, data: { Id: "WA-OK" } }), { status: 200 }),
+    });
+
+    // Part 0 is a 4xx, but parts 1 and 2 are still attempted.
+    expect(first.harness.sends).toHaveLength(3);
+    expect(first.result.explicitAcks).toEqual(["message-1"]);
+    expect(first.result.retryMessages).toEqual([]);
+    expect(first.harness.logs).toContain("error:outbound_permanent");
+
+    const parked = await db
+      .prepare("SELECT status FROM reply_parts WHERE delivery_id = 'd-plan-4xx' AND part_index = 0")
+      .first<{ status: string }>();
+    expect(parked?.status).toBe("failed");
+    // The parts that did arrive are still recorded, so history stays truthful.
+    expect(await outboundBodies()).toEqual(["Bagian dua", "Bagian tiga"]);
+  });
+
+  it("keeps a shadow-mode reply out of the ledger entirely", async () => {
+    const { harness, result } = await run([buildEnvelope("d-plan-shadow", CHAT, { conversation: "halo" })], {
+      mode: "shadow",
+      replyMessages: PARTS,
+    });
+
+    expect(harness.responderCalls).toBe(1);
+    expect(harness.sends).toHaveLength(0);
+    expect(result.explicitAcks).toEqual(["message-1"]);
+    // Nothing was sent, so no part may be recorded as sent.
+    const rows = await db
+      .prepare("SELECT status FROM reply_parts WHERE delivery_id = 'd-plan-shadow'")
+      .all<{ status: string }>();
+    expect(rows.results.map((row) => row.status)).toEqual(["pending", "pending", "pending"]);
   });
 });
 

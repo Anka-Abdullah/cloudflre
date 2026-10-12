@@ -95,8 +95,23 @@ export { containsNoAi, namesFromContact, noAiFromContact, resolveChatPolicy, ups
 export type { ChatPolicy, ContactRow, PolicyReason } from "./bot/contacts/policy";
 export { isDirectChatJid, syncContacts } from "./bot/contacts/sync";
 export type { ContactSyncOptions, ContactSyncResult } from "./bot/contacts/sync";
-export { deliverOutbound, describeOutbound, RATE_CAPACITY, RATE_REFILL_PER_SECOND } from "./bot/outbound";
-export type { OutboundContext, OutboundOutcome, SendFailure } from "./bot/outbound";
+export { deliverOutbound, deliverReplyPlan, describeOutbound, RATE_CAPACITY, RATE_REFILL_PER_SECOND } from "./bot/outbound";
+export type {
+  OutboundContext,
+  OutboundOutcome,
+  ReplyPlanOutcome,
+  ReplyPlanOutboundContext,
+  SendFailure,
+} from "./bot/outbound";
+export {
+  countReplyParts,
+  loadReplyPlan,
+  markReplyPartFailed,
+  markReplyPartSent,
+  replyMessageId,
+  saveReplyPlan,
+} from "./bot/reply-plan";
+export type { ReplyPart, ReplyPartCounts, ReplyPartStatus, StoredReplyPlan } from "./bot/reply-plan";
 export {
   buildMessages,
   catalogFor,
@@ -194,7 +209,7 @@ export type {
   OngkirSource,
   ResolvedProduct,
 } from "./bot/knowledge/catalog";
-export { WuzapiClient } from "./bot/wuzapi/client";
+export { WuzapiClient, isDataUrl, isHttpUrl, toDataUrl } from "./bot/wuzapi/client";
 export type { WuzapiClientDeps, WuzapiClientOptions, WuzapiSendResult } from "./bot/wuzapi/client";
 
 // ---- payment / orders (FASE 5) ---------------------------------------------

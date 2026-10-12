@@ -137,6 +137,7 @@ async function reset(): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM outbox"),
     db.prepare("DELETE FROM processed_events"),
+    db.prepare("DELETE FROM reply_parts"),
     db.prepare("DELETE FROM messages"),
   ]);
 }
