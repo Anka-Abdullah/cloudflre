@@ -42,7 +42,8 @@ describe("ChatCoordinator lock", () => {
     expect(claim.duplicate).toBe(false);
     expect(claim.retryAfterMs).toBe(0);
     expect(claim.lockUntil).toBeGreaterThan(0);
-    await releaseChat(bindings, chat, {});
+    expect(claim.lockId).not.toBe("");
+    await releaseChat(bindings, chat, { lockId: claim.lockId });
   });
 
   it("refuses the lock while another delivery holds it, and reports the wait", async () => {
@@ -53,7 +54,10 @@ describe("ChatCoordinator lock", () => {
     expect(first.locked).toBe(true);
     expect(second.locked).toBe(false);
     expect(second.retryAfterMs).toBeGreaterThan(0);
-    await releaseChat(bindings, chat, {});
+    // A caller that lost the race is given no ownership token, so it cannot
+    // release a lock it never held.
+    expect(second.lockId).toBe("");
+    await releaseChat(bindings, chat, { lockId: first.lockId });
   });
 
   it("keeps chats independent", async () => {
@@ -63,17 +67,19 @@ describe("ChatCoordinator lock", () => {
     const b = (await claimChat(bindings, chatB, { deliveryId: "d-b" })) as ClaimResponse;
     expect(a.locked).toBe(true);
     expect(b.locked).toBe(true);
-    await releaseChat(bindings, chatA, {});
-    await releaseChat(bindings, chatB, {});
+    await releaseChat(bindings, chatA, { lockId: a.lockId });
+    await releaseChat(bindings, chatB, { lockId: b.lockId });
   });
 
   it("frees the lock on release", async () => {
     const chat = uniqueChat("lock-release");
-    await claimChat(bindings, chat, { deliveryId: "d-1", lockTtlMs: 60_000 });
-    await releaseChat(bindings, chat, {});
+    const holder = (await claimChat(bindings, chat, { deliveryId: "d-1", lockTtlMs: 60_000 })) as ClaimResponse;
+    const released = await releaseChat(bindings, chat, { lockId: holder.lockId });
+    expect(released?.released).toBe(true);
+
     const again = (await claimChat(bindings, chat, { deliveryId: "d-2" })) as ClaimResponse;
     expect(again.locked).toBe(true);
-    await releaseChat(bindings, chat, {});
+    await releaseChat(bindings, chat, { lockId: again.lockId });
   });
 
   it("expires a lock whose TTL has passed", async () => {
@@ -83,13 +89,77 @@ describe("ChatCoordinator lock", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     const second = (await claimChat(bindings, chat, { deliveryId: "d-2" })) as ClaimResponse;
     expect(second.locked).toBe(true);
-    await releaseChat(bindings, chat, {});
+    await releaseChat(bindings, chat, { lockId: second.lockId });
+  });
+
+  it("does not let a stale attempt release the lock that replaced it", async () => {
+    // The race this guards: attempt A holds the lock, A stalls past its TTL,
+    // attempt B takes over — and then A finishes and releases. Before ownership
+    // was tracked, A's release freed B's lock and a third delivery could start a
+    // second turn while B was still mid-turn.
+    const chat = uniqueChat("lock-ownership");
+    const a = (await claimChat(bindings, chat, { deliveryId: "d-a", lockTtlMs: 1 })) as ClaimResponse;
+    expect(a.locked).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const b = (await claimChat(bindings, chat, { deliveryId: "d-b", lockTtlMs: 60_000 })) as ClaimResponse;
+    expect(b.locked).toBe(true);
+    expect(b.lockId).not.toBe(a.lockId);
+
+    // A comes back and releases with the token it was given.
+    const staleRelease = await releaseChat(bindings, chat, { deliveryId: "d-a", lockId: a.lockId });
+    expect(staleRelease?.released).toBe(false);
+
+    // B's lock is still alive: a third attempt must be refused.
+    const third = (await claimChat(bindings, chat, { deliveryId: "d-c", lockTtlMs: 60_000 })) as ClaimResponse;
+    expect(third.locked).toBe(false);
+    expect(third.retryAfterMs).toBeGreaterThan(0);
+
+    const ownerRelease = await releaseChat(bindings, chat, { deliveryId: "d-b", lockId: b.lockId });
+    expect(ownerRelease?.released).toBe(true);
+  });
+
+  it("still records a delivery that completed after losing the lock", async () => {
+    // The seen-set is a statement about work that happened, not about the lock:
+    // a delivery that really finished must stay remembered, or a redelivery
+    // would answer the customer a second time.
+    const chat = uniqueChat("lock-stale-seen");
+    const a = (await claimChat(bindings, chat, { deliveryId: "d-stale", lockTtlMs: 1 })) as ClaimResponse;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const b = (await claimChat(bindings, chat, { deliveryId: "d-other", lockTtlMs: 60_000 })) as ClaimResponse;
+
+    const stale = await releaseChat(bindings, chat, {
+      deliveryId: "d-stale",
+      lockId: a.lockId,
+      rememberDelivery: true,
+    });
+    expect(stale?.released).toBe(false);
+    // B's lock survived…
+    expect(stale?.lockUntil).toBeGreaterThan(0);
+
+    // …but replaying "d-stale" is still recognised as already handled.
+    await releaseChat(bindings, chat, { lockId: b.lockId });
+    const replay = (await claimChat(bindings, chat, { deliveryId: "d-stale" })) as ClaimResponse;
+    expect(replay.duplicate).toBe(true);
+    await releaseChat(bindings, chat, { lockId: replay.lockId });
+  });
+
+  it("ignores a release that presents no ownership token", async () => {
+    const chat = uniqueChat("lock-no-token");
+    const holder = (await claimChat(bindings, chat, { deliveryId: "d-1", lockTtlMs: 60_000 })) as ClaimResponse;
+
+    const anonymous = await releaseChat(bindings, chat, { deliveryId: "d-1" });
+    expect(anonymous?.released).toBe(false);
+
+    const stillHeld = (await claimChat(bindings, chat, { deliveryId: "d-2", lockTtlMs: 60_000 })) as ClaimResponse;
+    expect(stillHeld.locked).toBe(false);
+    await releaseChat(bindings, chat, { lockId: holder.lockId });
   });
 
   it("remembers a completed delivery and reports it as a duplicate", async () => {
     const chat = uniqueChat("lock-seen");
-    await claimChat(bindings, chat, { deliveryId: "d-1" });
-    await releaseChat(bindings, chat, { deliveryId: "d-1", rememberDelivery: true });
+    const first = (await claimChat(bindings, chat, { deliveryId: "d-1" })) as ClaimResponse;
+    await releaseChat(bindings, chat, { deliveryId: "d-1", lockId: first.lockId, rememberDelivery: true });
 
     const replayed = (await claimChat(bindings, chat, { deliveryId: "d-1" })) as ClaimResponse;
     expect(replayed.duplicate).toBe(true);
@@ -97,24 +167,27 @@ describe("ChatCoordinator lock", () => {
 
     const other = (await claimChat(bindings, chat, { deliveryId: "d-2" })) as ClaimResponse;
     expect(other.duplicate).toBe(false);
-    await releaseChat(bindings, chat, {});
+    await releaseChat(bindings, chat, { lockId: replayed.lockId });
   });
 
   it("does not remember a delivery that was released without rememberDelivery", async () => {
     const chat = uniqueChat("lock-no-remember");
-    await claimChat(bindings, chat, { deliveryId: "d-1" });
-    await releaseChat(bindings, chat, { deliveryId: "d-1" });
+    const first = (await claimChat(bindings, chat, { deliveryId: "d-1" })) as ClaimResponse;
+    await releaseChat(bindings, chat, { deliveryId: "d-1", lockId: first.lockId });
     const retry = (await claimChat(bindings, chat, { deliveryId: "d-1" })) as ClaimResponse;
     expect(retry.duplicate).toBe(false);
-    await releaseChat(bindings, chat, {});
+    await releaseChat(bindings, chat, { lockId: retry.lockId });
   });
 
   it("persists state across eviction", async () => {
     const chat = uniqueChat("lock-evict");
-    await claimChat(bindings, chat, { deliveryId: "d-1", lockTtlMs: 60_000 });
+    const holder = (await claimChat(bindings, chat, { deliveryId: "d-1", lockTtlMs: 60_000 })) as ClaimResponse;
     const saved = await status(chat);
     expect(saved["lockUntil"]).toBeGreaterThan(0);
-    await releaseChat(bindings, chat, {});
+    // The owner survives an eviction too, so a restart cannot lose the token the
+    // holder will present on release.
+    expect(saved["lockId"]).toBe(holder.lockId);
+    await releaseChat(bindings, chat, { lockId: holder.lockId });
   });
 });
 

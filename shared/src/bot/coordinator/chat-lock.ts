@@ -34,6 +34,14 @@ const MAX_SEEN_ENTRIES = 500;
 export interface CoordinatorState {
   /** Epoch ms until which the chat is locked; 0 means free. */
   lockUntil: number;
+  /**
+   * Who holds the lock. Every claim that wins generates a fresh id, and a
+   * release only clears the lock when it presents that same id — otherwise an
+   * attempt whose TTL had already expired would free the lock of the attempt
+   * that replaced it, letting a third attempt start while the second is still
+   * mid-turn.
+   */
+  lockId: string;
   /** deliveryId → epoch ms when the entry may be forgotten. */
   seen: Record<string, number>;
   /** Token bucket state (only meaningful on the rate-limiter instance). */
@@ -56,15 +64,34 @@ export interface ClaimResponse {
   lockUntil: number;
   /** Milliseconds until the lock frees; 0 when the caller owns it. */
   retryAfterMs: number;
+  /**
+   * Ownership token for this claim; empty when the lock was not granted. The
+   * holder must present it on release.
+   */
+  lockId: string;
 }
 
 export interface ReleaseRequest {
   deliveryId?: string;
+  /**
+   * The token returned by the winning claim. A release whose id does not match
+   * the current holder leaves the lock alone; the seen-set bookkeeping still
+   * applies, because completing the work is a fact regardless of who holds the
+   * lock now.
+   */
+  lockId?: string;
   /** Remember the delivery id as handled (only after the work really finished). */
   rememberDelivery?: boolean;
   seenTtlMs?: number;
   direction?: "in" | "out";
   at?: number;
+}
+
+export interface ReleaseResponse {
+  ok: boolean;
+  /** False when the lock belonged to a newer attempt and was left untouched. */
+  released: boolean;
+  lockUntil: number;
 }
 
 export interface RateRequest {
@@ -84,7 +111,15 @@ export interface RateResponse {
 }
 
 function emptyState(): CoordinatorState {
-  return { lockUntil: 0, seen: {}, tokens: 0, tokensAt: 0, lastInboundAt: 0, lastOutboundAt: 0 };
+  return {
+    lockUntil: 0,
+    lockId: "",
+    seen: {},
+    tokens: 0,
+    tokensAt: 0,
+    lastInboundAt: 0,
+    lastOutboundAt: 0,
+  };
 }
 
 function asNumber(value: unknown, fallback: number): number {
@@ -164,8 +199,11 @@ export class ChatCoordinator {
     const duplicate = deliveryId !== "" && (this.data.seen[deliveryId] ?? 0) > now;
     const locked = this.data.lockUntil <= now;
 
+    let lockId = "";
     if (locked) {
+      lockId = crypto.randomUUID();
       this.data.lockUntil = now + lockTtlMs;
+      this.data.lockId = lockId;
       this.data.lastInboundAt = now;
       await this.persist();
     }
@@ -175,6 +213,9 @@ export class ChatCoordinator {
       duplicate,
       lockUntil: this.data.lockUntil,
       retryAfterMs: locked ? 0 : Math.max(1, this.data.lockUntil - now),
+      // Only the winner gets a token; a caller that lost the race has nothing to
+      // release and must not be handed the current holder's id.
+      lockId,
     };
     return json(200, { ...response });
   }
@@ -182,10 +223,23 @@ export class ChatCoordinator {
   private async release(request: Request, now: number): Promise<Response> {
     const input = await this.body(request);
     const deliveryId = typeof input["deliveryId"] === "string" ? input["deliveryId"] : "";
+    const lockId = typeof input["lockId"] === "string" ? input["lockId"] : "";
     const remember = input["rememberDelivery"] === true;
     const seenTtlMs = asNumber(input["seenTtlMs"], DEFAULT_SEEN_TTL_MS);
 
-    this.data.lockUntil = 0;
+    // Only the current holder may free the lock. Without this check a slow
+    // attempt whose TTL had already expired would clear the lock of the attempt
+    // that took over, and a third delivery could then start a second turn while
+    // the second was still running.
+    const released = lockId !== "" && lockId === this.data.lockId;
+    if (released) {
+      this.data.lockUntil = 0;
+      this.data.lockId = "";
+    }
+
+    // These are statements about work that happened, not about the lock, so they
+    // apply even when the lock had already moved on: a delivery that really
+    // finished must stay remembered or a redelivery would answer twice.
     if (remember && deliveryId !== "") {
       this.data.seen[deliveryId] = now + seenTtlMs;
       this.pruneSeen(now);
@@ -194,7 +248,8 @@ export class ChatCoordinator {
     else if (input["direction"] === "in") this.data.lastInboundAt = asNumber(input["at"], now);
 
     await this.persist();
-    return json(200, { ok: true, lockUntil: this.data.lockUntil });
+    const response: ReleaseResponse = { ok: true, released, lockUntil: this.data.lockUntil };
+    return json(200, { ...response });
   }
 
   private async rate(request: Request, now: number): Promise<Response> {
@@ -277,12 +332,19 @@ export async function claimChat(
   return (await post(stub, "/claim", input)) as ClaimResponse;
 }
 
+/**
+ * Releases the lock, if this caller still owns it.
+ *
+ * Returns null when the deployment has no CHAT_COORDINATOR binding. The result
+ * reports whether the lock was actually freed, which is what lets a caller tell
+ * "I finished" apart from "a newer attempt had already taken over".
+ */
 export async function releaseChat(
   env: Pick<Env, "CHAT_COORDINATOR">,
   chatJid: string,
   input: ReleaseRequest,
-): Promise<void> {
+): Promise<ReleaseResponse | null> {
   const stub = coordinatorFor(env, chatJid);
-  if (!stub) return;
-  await post(stub, "/release", input);
+  if (!stub) return null;
+  return (await post(stub, "/release", input)) as ReleaseResponse;
 }

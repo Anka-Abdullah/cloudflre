@@ -23,7 +23,7 @@
  * otherwise the order goes to `awaiting_approval` and waits for the Telegram card
  * or `POST /admin/orders/<kode>/approve`.
  */
-import type { Env, InstanceConfig } from "../../config";
+import { botReadiness, type Env, type InstanceConfig } from "../../config";
 import type { Logger } from "../../lib/logger";
 import type { ResolvedProduct } from "../knowledge/catalog";
 import type { OutboundMessage } from "../types";
@@ -71,7 +71,8 @@ export interface CheckoutDeps {
 }
 
 export interface CheckoutContext {
-  env: Pick<Env, "BOT_DB">;
+  /** CHAT_COORDINATOR is needed so an immediate flush shares the number's rate bucket. */
+  env: Pick<Env, "BOT_DB" | "CHAT_COORDINATOR">;
   config: InstanceConfig;
   log: Logger;
   now: () => Date;
@@ -730,11 +731,14 @@ export async function queueCustomerMessage(
   if (!context.wuzapi) return { enqueued: true, deduped: false, sent: false };
 
   const flushed = await flushOutbox({
-    env: { BOT_DB: db },
+    env: { BOT_DB: db, CHAT_COORDINATOR: context.env.CHAT_COORDINATOR },
     config: context.config,
     client: context.wuzapi,
     log: context.log,
     limit: 5,
+    // Queued confirmations are customer-facing too, so they obey the same gate as
+    // everything else: mode `on` *and* a fully configured number.
+    deliver: context.config.bot.mode === "on" && botReadiness(context.config, context.env).ready,
   });
   return { enqueued: true, deduped: false, sent: flushed.sent > 0 };
 }

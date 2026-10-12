@@ -31,6 +31,8 @@ import { settlePayment } from "../src/bot/payment/settle";
 import { ensureTursoSchema, findOrderByKode, findPaymentForOrder } from "../src/bot/payment/turso";
 import { enqueueOutbox, listOutboxForOrder, outboxStats, parseOutboxMessage } from "../src/bot/outbox/store";
 import { flushOutbox } from "../src/bot/outbox/flush";
+import { rateLimiterFor } from "../src/bot/coordinator/chat-lock";
+import { deliverOutbound } from "../src/bot/outbound";
 import { buildNotaDocument, renderNotaPdf, renderNotaText, sanitise } from "../src/bot/nota/pdf";
 import { TelegramClient } from "../src/bot/telegram/client";
 import { parseFeeAmount } from "../src/bot/telegram/cards";
@@ -520,6 +522,7 @@ describe("outbox", () => {
 
     const result = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config(),
       client: wuzapi.client,
       log: quiet,
@@ -536,6 +539,7 @@ describe("outbox", () => {
     // A second flush has nothing to do: the row is not pending any more.
     const again = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config(),
       client: wuzapi.client,
       log: quiet,
@@ -551,6 +555,7 @@ describe("outbox", () => {
 
     const result = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config({}, { retryBaseSeconds: 15 }),
       client: wuzapi.client,
       log: quiet,
@@ -571,6 +576,7 @@ describe("outbox", () => {
     // First pass claims the row but "dies" before sending (leaseId forced, no send).
     const claimed = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config({ outboxLeaseSeconds: 60 }),
       client: { sendText: async () => ({ ok: false, messageId: null, status: 500, error: "died", permanent: false, attempts: 1 }) } as unknown as WuzapiClient,
       log: quiet,
@@ -582,6 +588,7 @@ describe("outbox", () => {
     // The lease is live, so another pass must not steal the row yet.
     const tooEarly = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config({ outboxLeaseSeconds: 60 }),
       client: wuzapi.client,
       log: quiet,
@@ -592,6 +599,7 @@ describe("outbox", () => {
     // After the backoff window it is picked up again.
     const later = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config({ outboxLeaseSeconds: 60 }),
       client: wuzapi.client,
       log: quiet,
@@ -611,6 +619,7 @@ describe("outbox", () => {
 
     const result = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config(),
       client: wuzapiStub().client,
       log: quiet,
@@ -626,6 +635,7 @@ describe("outbox", () => {
 
     const result = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: false,
       config: { ...config(), bot: { ...config().bot, mode: "shadow" } },
       client: wuzapi.client,
       log: quiet,
@@ -646,6 +656,7 @@ describe("outbox", () => {
 
     const result = await flushOutbox({
       env: { BOT_DB: db },
+      deliver: true,
       config: config({ outboxMaxAttempts: 6 }),
       client: wuzapi.client,
       log: quiet,
@@ -653,6 +664,203 @@ describe("outbox", () => {
     });
     expect(result.failed).toBe(1);
     expect((await outboxStats(db)).failed).toBe(1);
+  });
+});
+
+/**
+ * WP-3B / WP-3C — the two gates the outbox used to be missing.
+ *
+ * It only ever checked `BOT_MODE !== "on"`, so a number with `BOT_MODE=on` and a
+ * missing secret stayed silent for replies (the direct path suppresses itself)
+ * while the cron happily drained receipts to real customers. And it never
+ * consulted the number's token bucket, so a busy number could be drained through
+ * the outbox instead of the reply path.
+ */
+describe("outbox readiness gate and rate limit", () => {
+  const coordinator = (env as unknown as Env).CHAT_COORDINATOR;
+
+  /** A slug nothing else in this suite uses, so the bucket is ours to drain. */
+  function freshSlug(): string {
+    return `6289${String(Math.floor(Math.random() * 100_000_000)).padStart(8, "0")}`;
+  }
+
+  /**
+   * Spends tokens so the bucket is left with `capacity - cost`. The limiter is a
+   * real Durable Object: the test drains the same instance the code under test
+   * will read, rather than mocking the throttle away.
+   */
+  async function spendTokens(slug: string, capacity: number, cost: number): Promise<void> {
+    const limiter = rateLimiterFor({ CHAT_COORDINATOR: coordinator }, slug);
+    if (!limiter) throw new Error("CHAT_COORDINATOR binding is missing");
+    const response = await limiter.fetch("https://coordinator/rate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capacity, refillPerSecond: 0.000001, cost }),
+    });
+    const payload = (await response.json()) as { allowed: boolean };
+    expect(payload.allowed).toBe(true);
+  }
+
+  it("sends nothing when the mode is on but the number is not ready", async () => {
+    const wuzapi = wuzapiStub();
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "k-degraded",
+      at: 1_000,
+    });
+
+    // What a caller computes for a half-provisioned number: the mode says `on`,
+    // readiness says the AI key is missing, so `deliver` is false.
+    const result = await flushOutbox({
+      env: { BOT_DB: db },
+      deliver: false,
+      config: config({ mode: "on", aiApiKey: "" }),
+      client: wuzapi.client,
+      log: quiet,
+      now: () => new Date(2_000),
+    });
+
+    expect(result).toMatchObject({ claimed: 1, sent: 0, suppressed: 1 });
+    expect(wuzapi.calls.filter((call) => call.url.includes("/chat/send/"))).toHaveLength(0);
+    // Parked, not piled up: switching to a working configuration later must not
+    // blast out everything that queued up while the number was degraded.
+    const stats = await outboxStats(db);
+    expect(stats.failed).toBe(1);
+    expect(stats.pending).toBe(0);
+  });
+
+  it("retries rather than sends when the number's token bucket is empty", async () => {
+    const slug = freshSlug();
+    await spendTokens(slug, 1, 1);
+
+    const wuzapi = wuzapiStub();
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "k-rate",
+      at: 1_000,
+    });
+
+    const result = await flushOutbox({
+      env: { BOT_DB: db, CHAT_COORDINATOR: coordinator },
+      deliver: true,
+      config: config({}, { slug }),
+      client: wuzapi.client,
+      log: quiet,
+      now: () => new Date(2_000),
+      sleep: async () => {},
+      random: () => 0,
+    });
+
+    expect(wuzapi.calls.filter((call) => call.url.includes("/chat/send/"))).toHaveLength(0);
+    expect(result).toMatchObject({ sent: 0, retried: 1, failed: 0 });
+    // Retried, not failed: the message was delayed by the throttle, not rejected.
+    const stats = await outboxStats(db);
+    expect(stats.pending).toBe(1);
+    expect(stats.claimed).toBe(0);
+    expect(stats.failed).toBe(0);
+  });
+
+  it("parks the whole batch once the bucket runs dry mid-pass", async () => {
+    const slug = freshSlug();
+    // Leaves exactly one token: the first row is sent, the rest must not be.
+    await spendTokens(slug, 2, 1);
+
+    const wuzapi = wuzapiStub();
+    for (const key of ["k-batch-1", "k-batch-2", "k-batch-3"]) {
+      await enqueueOutbox(db, {
+        message: { kind: "text", body: key },
+        chatJid: CHAT,
+        dedupeKey: key,
+        at: 1_000,
+      });
+    }
+
+    const result = await flushOutbox({
+      env: { BOT_DB: db, CHAT_COORDINATOR: coordinator },
+      deliver: true,
+      config: config({}, { slug }),
+      client: wuzapi.client,
+      log: quiet,
+      now: () => new Date(2_000),
+      sleep: async () => {},
+      random: () => 0,
+    });
+
+    expect(result.sent).toBe(1);
+    // The pass stops instead of sleeping through the batch, so no row is left
+    // stranded in `claimed` waiting for its lease to expire.
+    expect(result.retried).toBe(2);
+    const stats = await outboxStats(db);
+    expect(stats.sent).toBe(1);
+    expect(stats.pending).toBe(2);
+    expect(stats.claimed).toBe(0);
+  });
+
+  it("shares one bucket between the direct reply path and the outbox", async () => {
+    // The bucket is per number, not per code path: a drained bucket must refuse
+    // both, or a busy number could be drained twice as fast.
+    const slug = freshSlug();
+    await spendTokens(slug, 1, 1);
+    const scenario = config({}, { slug });
+
+    const wuzapi = wuzapiStub();
+    const direct = await deliverOutbound(
+      {
+        env: { CHAT_COORDINATOR: coordinator },
+        config: scenario,
+        client: wuzapi.client,
+        log: quiet,
+        deliver: true,
+        sleep: async () => {},
+      },
+      CHAT,
+      [{ kind: "text", body: "halo" }],
+    );
+    expect(direct.sent).toBe(0);
+    expect(direct.failures[0]?.error).toBe("rate limited");
+
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "k-shared",
+      at: 1_000,
+    });
+    const flushed = await flushOutbox({
+      env: { BOT_DB: db, CHAT_COORDINATOR: coordinator },
+      deliver: true,
+      config: scenario,
+      client: wuzapi.client,
+      log: quiet,
+      now: () => new Date(2_000),
+      sleep: async () => {},
+      random: () => 0,
+    });
+    expect(flushed.sent).toBe(0);
+    expect(flushed.retried).toBe(1);
+    expect(wuzapi.calls.filter((call) => call.url.includes("/chat/send/"))).toHaveLength(0);
+  });
+
+  it("still sends when the deployment has no coordinator, because that is not a correctness boundary", async () => {
+    const wuzapi = wuzapiStub();
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "k-no-coordinator",
+      at: 1_000,
+    });
+
+    const result = await flushOutbox({
+      env: { BOT_DB: db },
+      deliver: true,
+      config: config(),
+      client: wuzapi.client,
+      log: quiet,
+      now: () => new Date(2_000),
+    });
+
+    expect(result.sent).toBe(1);
   });
 });
 

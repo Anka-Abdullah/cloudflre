@@ -140,6 +140,54 @@ describe("cron — outbox flush", () => {
     expect((await outboxStats(db)).sent).toBe(1);
   });
 
+  /**
+   * WP-3B at the level that matters: the *caller* has to compute the gate.
+   *
+   * The flusher only obeys `deliver`, so a cron that passed `true` while the
+   * number was degraded would still have drained the outbox. These two tests run
+   * the real `runCronJobs` with the only difference being readiness, which is
+   * what pins the wiring rather than the flag.
+   */
+  it("does not drain the outbox when BOT_MODE=on but the number is not ready", async () => {
+    const wuzapi = wuzapiStub();
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "cron-degraded",
+      at: 1_000,
+    });
+
+    const result = await runCronJobs({
+      env: env as unknown as Env,
+      // The mode says `on`; the missing AI key is what makes botReadiness false.
+      config: config({ aiApiKey: "" }),
+      deps: { sqlClient: sql, client: wuzapi.client, log: quiet, now: () => new Date(2_000) },
+    });
+
+    expect(result.jobs["outbox_flush"]).toMatchObject({ claimed: 1, sent: 0, suppressed: 1 });
+    expect(wuzapi.calls.filter((call) => call.url.includes("/chat/send/"))).toHaveLength(0);
+    expect((await outboxStats(db)).failed).toBe(1);
+  });
+
+  it("drains it once the same number is fully configured", async () => {
+    const wuzapi = wuzapiStub();
+    await enqueueOutbox(db, {
+      message: { kind: "text", body: "nota" },
+      chatJid: CHAT,
+      dedupeKey: "cron-ready",
+      at: 1_000,
+    });
+
+    const result = await runCronJobs({
+      env: env as unknown as Env,
+      config: config(),
+      deps: { sqlClient: sql, client: wuzapi.client, log: quiet, now: () => new Date(2_000) },
+    });
+
+    expect(result.jobs["outbox_flush"]).toMatchObject({ claimed: 1, sent: 1 });
+    expect((await outboxStats(db)).sent).toBe(1);
+  });
+
   it("keeps going into the other jobs after a job fails", async () => {
     const result = await runCronJobs({
       env: env as unknown as Env,

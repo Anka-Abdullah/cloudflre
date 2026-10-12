@@ -21,6 +21,7 @@
 import type { Env, InstanceConfig } from "../../config";
 import type { Logger } from "../../lib/logger";
 import { retryDelaySeconds } from "../../lib/backoff";
+import { takeRateToken } from "../send-throttle";
 import type { WuzapiClient } from "../wuzapi/client";
 import {
   claimOutboxRows,
@@ -32,10 +33,23 @@ import {
 } from "./store";
 
 export interface FlushOptions {
-  env: Pick<Env, "BOT_DB">;
+  env: Pick<Env, "BOT_DB" | "CHAT_COORDINATOR">;
   config: InstanceConfig;
   client: WuzapiClient;
   log: Logger;
+  /**
+   * Whether this pass may actually put a message in front of a customer.
+   *
+   * The caller must compute it as
+   * `config.bot.mode === "on" && botReadiness(config, env).ready`.
+   *
+   * It is required, and deliberately not derived here, because the two ways of
+   * being unready are different faults — the mode is an operator switch, the
+   * readiness is a missing secret or binding — and the caller already knows
+   * which one applies. A required flag also means a new caller cannot forget it
+   * and quietly blast a backlog the moment the number is switched to `on`.
+   */
+  deliver: boolean;
   now?: () => Date;
   /** Overrides OUTBOX_BATCH for one pass (the admin flush uses it). */
   limit?: number;
@@ -44,6 +58,8 @@ export interface FlushOptions {
   randomId?: () => string;
   /** Test seam: forces a fresh lease id, so a test can simulate a dead flusher. */
   leaseId?: string;
+  /** Test seam: replaces the wait for a rate-limit token. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface FlushResult {
@@ -101,14 +117,21 @@ export async function flushOutbox(options: FlushOptions): Promise<FlushResult> {
   result.rowIds = rows.map((row) => row.id);
   if (rows.length === 0) return result;
 
-  // Shadow (and `off`) mode never talks to a customer, and that includes the
-  // outbox: the direct path already stops at `deliverOutbound`, but the flusher
-  // is reached by the cron too. The rows are claimed and parked as `failed` with
-  // an explicit reason, so nothing is sent *and* nothing silently piles up to be
-  // blasted out the moment the operator switches to `on`.
-  if (config.bot.mode !== "on") {
+  // Nothing leaves the worker unless the whole number is actually ready — mode
+  // `on` *and* every prerequisite present. The direct path already stops at
+  // `deliverOutbound`, but the flusher is reached by the cron too, so without
+  // this check a half-provisioned number (`BOT_MODE=on`, missing AI_API_KEY)
+  // stayed silent for replies while still blasting receipts out of the outbox.
+  // Rows are claimed and parked as `failed` with an explicit reason, so nothing
+  // is sent *and* nothing silently piles up to be delivered the moment the
+  // operator fixes the configuration.
+  if (!options.deliver) {
+    const reason =
+      config.bot.mode !== "on"
+        ? `BOT_MODE=${config.bot.mode}: tidak dikirim`
+        : "BOT_MODE=on but the bot is not ready (degraded): tidak dikirim";
     for (const row of rows) {
-      await markOutboxFailed(db, { id: row.id, leaseId, error: `BOT_MODE=${config.bot.mode}: tidak dikirim` });
+      await markOutboxFailed(db, { id: row.id, leaseId, error: reason });
       result.suppressed += 1;
       log.info("outbound_suppressed_shadow", {
         chatJid: row.chatJid,
@@ -116,12 +139,14 @@ export async function flushOutbox(options: FlushOptions): Promise<FlushResult> {
         orderRef: row.orderRef,
         via: "outbox",
         mode: config.bot.mode,
+        degraded: config.bot.mode === "on",
       });
     }
     return result;
   }
 
-  for (const row of rows) {
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index] as OutboxRow;
     const message = parseOutboxMessage(row);
     if (!message) {
       // Poison row: sending it is impossible, retrying it is pointless. Mark it
@@ -130,6 +155,37 @@ export async function flushOutbox(options: FlushOptions): Promise<FlushResult> {
       result.dropped += 1;
       log.error("outbox_poison_payload", { id: row.id, chatJid: row.chatJid, orderRef: row.orderRef });
       continue;
+    }
+
+    // Every send draws from the same number-wide bucket as the direct reply
+    // path, so a busy number cannot be drained through the outbox instead.
+    if (!(await takeRateToken({ env, config, log, ...(options.sleep ? { sleep: options.sleep } : {}) }))) {
+      const delaySeconds = retryDelaySeconds(row.attempts, {
+        baseSeconds: config.retryBaseSeconds,
+        maxSeconds: config.retryMaxSeconds,
+        ...(options.random ? { random: options.random } : {}),
+      });
+      // The bucket is per number, so if it is empty for this row it is empty for
+      // the rest of the batch. Park this row and every row after it and stop,
+      // rather than sleeping through the whole batch: at ~2 s per refusal a
+      // 20-row pass would otherwise spend a minute asleep inside one invocation.
+      for (const pending of rows.slice(index)) {
+        await markOutboxRetry(db, {
+          id: pending.id,
+          leaseId,
+          nextAttemptAt: now + delaySeconds * 1_000,
+          error: "rate limited",
+        });
+        result.retried += 1;
+        log.warn("outbox_retry", {
+          id: pending.id,
+          chatJid: pending.chatJid,
+          attempts: pending.attempts,
+          delaySeconds,
+          error: "rate limited",
+        });
+      }
+      break;
     }
 
     const sendResult = await sendOutboxMessage(client, row, message, log);

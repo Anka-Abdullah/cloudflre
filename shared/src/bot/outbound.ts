@@ -16,18 +16,15 @@
 import type { InstanceConfig } from "../config";
 import type { Env } from "../config";
 import type { Logger } from "../lib/logger";
-import { rateLimiterFor } from "./coordinator/chat-lock";
 import { markReplyPartFailed, markReplyPartSent, type StoredReplyPlan } from "./reply-plan";
+import { RATE_CAPACITY, RATE_REFILL_PER_SECOND, takeRateToken } from "./send-throttle";
 import type { OutboundMessage } from "./types";
 import type { WuzapiClient, WuzapiSendResult } from "./wuzapi/client";
 
-/** Burst size; also the bucket capacity. */
-export const RATE_CAPACITY = 30;
-/** 0.5 tokens/second ≈ 30 messages/minute sustained. */
-export const RATE_REFILL_PER_SECOND = 0.5;
-/** How long a single send waits for a token before giving up to the caller. */
-const RATE_WAIT_ATTEMPTS = 3;
-const RATE_WAIT_MAX_MS = 5_000;
+// Re-exported so existing importers keep working; the bucket itself now lives in
+// send-throttle.ts, which the outbox flusher shares.
+export { RATE_CAPACITY, RATE_REFILL_PER_SECOND };
+
 /**
  * Gap between two messages of the same reply. A customer who receives four
  * bubbles in 40 ms is talking to a machine; 1–3 s is what a human assistant
@@ -68,41 +65,14 @@ function defaultSleep(ms: number): Promise<void> {
 }
 
 /**
- * Waits for a token. Returns false when the bucket stays empty, which the caller
- * turns into a retry rather than an unbounded wait inside the queue consumer.
+ * Waits for a token from the number-wide bucket (see `send-throttle.ts`).
+ *
+ * Kept as a thin wrapper so every call site in this file passes the same context
+ * — and, more importantly, so the direct path and the outbox cannot drift onto
+ * two different buckets.
  */
-async function takeRateToken(context: OutboundContext, sleep: (ms: number) => Promise<void>): Promise<boolean> {
-  const limiter = rateLimiterFor(context.env, context.config.slug);
-  if (!limiter) return true;
-
-  for (let attempt = 0; attempt < RATE_WAIT_ATTEMPTS; attempt++) {
-    let payload: { allowed?: boolean; retryAfterMs?: number };
-    try {
-      const response = await limiter.fetch("https://coordinator/rate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          capacity: RATE_CAPACITY,
-          refillPerSecond: RATE_REFILL_PER_SECOND,
-          cost: 1,
-        }),
-      });
-      payload = (await response.json()) as { allowed?: boolean; retryAfterMs?: number };
-    } catch (error) {
-      // A failing rate limiter must not stop the bot from answering; the token
-      // bucket protects WhatsApp, it is not a correctness boundary.
-      context.log.warn("rate_limit_unavailable", { error: String(error) });
-      return true;
-    }
-
-    if (payload.allowed === true) return true;
-    const waitMs = Math.min(Math.max(0, payload.retryAfterMs ?? 1_000), RATE_WAIT_MAX_MS);
-    if (waitMs <= 0) continue;
-    await sleep(waitMs);
-  }
-
-  context.log.warn("rate_limited", { capacity: RATE_CAPACITY, refillPerSecond: RATE_REFILL_PER_SECOND });
-  return false;
+async function waitForRateToken(context: OutboundContext, sleep: (ms: number) => Promise<void>): Promise<boolean> {
+  return await takeRateToken({ env: context.env, config: context.config, log: context.log, sleep });
 }
 
 /**
@@ -175,7 +145,7 @@ export async function deliverOutbound(
     }
     handled += 1;
 
-    if (!(await takeRateToken(context, sleep))) {
+    if (!(await waitForRateToken(context, sleep))) {
       failures.push({ message, error: "rate limited", attempts: 0, permanent: false });
       continue;
     }
@@ -300,7 +270,7 @@ export async function deliverReplyPlan(
     }
     handled += 1;
 
-    if (!(await takeRateToken(context, sleep))) {
+    if (!(await waitForRateToken(context, sleep))) {
       outcome.failures.push({ message, error: "rate limited", attempts: 0, permanent: false });
       outcome.pendingIndexes.push(part.index);
       // A dry bucket also stops this pass: the remaining parts are still pending

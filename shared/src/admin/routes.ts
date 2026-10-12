@@ -21,7 +21,7 @@
  * approval machine is the same one the card drives, so the operator can work
  * without Telegram at all.
  */
-import type { Env, InstanceConfig } from "../config";
+import { botReadiness, type Env, type InstanceConfig } from "../config";
 import { createLogger, type Logger } from "../lib/logger";
 import { timingSafeEqualString } from "../lib/hmac";
 import { invalidateCatalogCache } from "../bot/agent/run";
@@ -317,12 +317,16 @@ async function flushOutboxRoute(options: AdminOptions, log: Logger): Promise<Res
     });
 
   const result = await flushOutbox({
-    env: { BOT_DB: env.BOT_DB },
+    env: { BOT_DB: env.BOT_DB, CHAT_COORDINATOR: env.CHAT_COORDINATOR },
     config,
     client,
     log,
     now: options.deps?.now,
     limit: config.bot.outboxBatch,
+    // An operator-triggered flush obeys the same gate as the cron: it is a way to
+    // run the flush *now*, not a way to override the shadow switch. Forcing a
+    // send while the number is degraded is exactly the accident this prevents.
+    deliver: config.bot.mode === "on" && botReadiness(config, env).ready,
   });
   return json(200, { ok: true, ...result, stats: await outboxStats(env.BOT_DB) });
 }

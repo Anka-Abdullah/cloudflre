@@ -18,7 +18,7 @@
  *     same `payment.event` envelope a callback would, so the queue stays the only
  *     writer of order state and the accounting stays in one place.
  */
-import type { Env, InstanceConfig } from "./config";
+import { botReadiness, type Env, type InstanceConfig } from "./config";
 import { createLogger, type Logger } from "./lib/logger";
 import type { EnvelopeV1 } from "./envelope";
 import { pruneHistory } from "./bot/history";
@@ -144,6 +144,12 @@ export async function runCronJobs(options: CronOptions): Promise<CronResult> {
       deps: { log, ...(options.deps?.fetchImpl ? { fetchImpl: options.deps.fetchImpl } : {}) },
     });
 
+  // The cron is the safety net for every path that queues a message, so it has
+  // to apply exactly the same gate the queue consumer does: `on` *and* ready.
+  // Otherwise a number whose AI secret was removed would stay silent for replies
+  // while the cron kept draining a backlog of receipts to real customers.
+  const deliver = config.bot.mode === "on" && botReadiness(config, env).ready;
+
   const sql = resolveSql(options);
   const provider =
     options.deps?.provider ??
@@ -165,8 +171,23 @@ export async function runCronJobs(options: CronOptions): Promise<CronResult> {
   // ---- every minute --------------------------------------------------------
 
   jobs["outbox_flush"] = await runJob(log, "outbox_flush", async () => {
-    const result = await flushOutbox({ env, config, client, log, now: options.deps?.now });
-    return { claimed: result.claimed, sent: result.sent, retried: result.retried, failed: result.failed };
+    const result = await flushOutbox({
+      env,
+      config,
+      client,
+      log,
+      now: options.deps?.now,
+      deliver,
+    });
+    return {
+      claimed: result.claimed,
+      sent: result.sent,
+      retried: result.retried,
+      failed: result.failed,
+      // Reported because "claimed 1, sent 0, failed 0" looks like nothing
+      // happened; suppressed is the number that says why.
+      suppressed: result.suppressed,
+    };
   });
 
   jobs["expire_orders"] = await runJob(log, "expire_orders", async (): Promise<Record<string, unknown>> => {

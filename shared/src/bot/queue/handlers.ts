@@ -227,6 +227,10 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
     deliveryId: envelope.deliveryId,
     lockTtlMs: DEFAULT_LOCK_TTL_MS,
   });
+  // Ownership token for the lock this attempt took. Every release below has to
+  // present it: without that, an attempt whose TTL had already expired would free
+  // the lock of the attempt that replaced it.
+  const lockId = claim?.lockId ?? "";
   if (claim && !claim.locked) {
     log.info("event_locked", {
       deliveryId: envelope.deliveryId,
@@ -237,7 +241,7 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
   }
   if (claim?.duplicate === true) {
     log.info("event_duplicate", { deliveryId: envelope.deliveryId, chatJid: message.chatJid, source: "coordinator" });
-    await releaseChat(runtime.env, message.chatJid, { deliveryId: envelope.deliveryId });
+    await releaseChat(runtime.env, message.chatJid, { deliveryId: envelope.deliveryId, lockId });
     return { action: "ack", reason: "duplicate" };
   }
 
@@ -250,7 +254,11 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
     });
     if (!claimed) {
       log.info("event_duplicate", { deliveryId: envelope.deliveryId, chatJid: message.chatJid, source: "d1" });
-      await releaseChat(runtime.env, message.chatJid, { deliveryId: envelope.deliveryId, rememberDelivery: true });
+      await releaseChat(runtime.env, message.chatJid, {
+        deliveryId: envelope.deliveryId,
+        lockId,
+        rememberDelivery: true,
+      });
       return { action: "ack", reason: "duplicate" };
     }
 
@@ -324,7 +332,7 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
     if (outbound.suppressed) {
       // Shadow mode: nothing left the worker, so there is no progress to keep.
       // The delivery still settles `done`, which is the pre-existing contract.
-      await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid);
+      await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid, lockId);
       log.info("event_done", {
         deliveryId: envelope.deliveryId,
         chatJid: message.chatJid,
@@ -354,7 +362,7 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
       // A transient failure (5xx, timeout, empty bucket): the queue retry picks
       // up exactly the parts still pending, under their original message ids.
       await finishDelivery(db, envelope.deliveryId, "failed", at.getTime(), "outbound incomplete");
-      await releaseChat(runtime.env, message.chatJid, {});
+      await releaseChat(runtime.env, message.chatJid, { lockId });
       return { action: "retry", delaySeconds: 15 };
     }
 
@@ -368,11 +376,11 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
         failed: outbound.failedIndexes.length,
         error: outbound.failures[0]?.error ?? "unknown",
       });
-      await settle(runtime, envelope.deliveryId, "failed", "outbound permanently rejected", message.chatJid);
+      await settle(runtime, envelope.deliveryId, "failed", "outbound permanently rejected", message.chatJid, lockId);
       return { action: "ack", reason: "outbound_permanent" };
     }
 
-    await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid);
+    await settle(runtime, envelope.deliveryId, "done", undefined, message.chatJid, lockId);
     log.info("event_done", {
       deliveryId: envelope.deliveryId,
       chatJid: message.chatJid,
@@ -385,7 +393,7 @@ export async function handleWuzapiEvent(envelope: EnvelopeV1, runtime: BotRuntim
     const detail = error instanceof Error ? error.message : String(error);
     log.error("event_failed", { deliveryId: envelope.deliveryId, chatJid: message.chatJid, error: detail });
     await finishDelivery(db, envelope.deliveryId, "failed", runtime.now().getTime(), detail);
-    await releaseChat(runtime.env, message.chatJid, {});
+    await releaseChat(runtime.env, message.chatJid, { lockId });
     return { action: "retry", delaySeconds: 30 };
   }
 }
@@ -404,17 +412,20 @@ async function setTyping(runtime: BotRuntime, chatJid: string, state: "composing
   }
 }
 
-async function settle(  runtime: BotRuntime,
+async function settle(
+  runtime: BotRuntime,
   deliveryId: string,
   status: "done" | "failed",
-  error?: string,
-  chatJid?: string,
+  error: string | undefined,
+  chatJid: string | undefined,
+  lockId: string,
 ): Promise<void> {
   const db = runtime.env.BOT_DB;
   if (db) await finishDelivery(db, deliveryId, status, runtime.now().getTime(), error);
   if (chatJid) {
     await releaseChat(runtime.env, chatJid, {
       deliveryId,
+      lockId,
       rememberDelivery: status === "done",
     });
   }
@@ -579,6 +590,9 @@ export async function handlePaymentEvent(envelope: EnvelopeV1, runtime: BotRunti
       log,
       now: runtime.now,
       limit: 5,
+      // Same gate as the reply above: a half-provisioned number must not push a
+      // receipt through the outbox while its replies are being suppressed.
+      deliver: runtime.deliver,
     });
     log.info("payment_nota_flush", { sent: flushed.sent, retried: flushed.retried, claimed: flushed.claimed });
   }
@@ -601,6 +615,7 @@ export async function handleOutboxTick(envelope: EnvelopeV1, runtime: BotRuntime
     client: runtime.client,
     log: runtime.log,
     now: runtime.now,
+    deliver: runtime.deliver,
   });
   runtime.log.info("outbox_tick", { deliveryId: envelope.deliveryId, ...result });
   return { action: "ack", reason: `flushed:${result.sent}` };

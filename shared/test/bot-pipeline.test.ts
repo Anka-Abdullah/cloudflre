@@ -280,25 +280,28 @@ describe("idempotency", () => {
 
   it("retries instead of answering when another delivery holds the chat lock", async () => {
     const lockEnv = env as unknown as Env;
-    await claimChat(lockEnv, CHAT, { deliveryId: "d-holder", lockTtlMs: 60_000 });
+    // The lock is released with the token the claim returned: a release without
+    // one is (correctly) ignored, and the leaked 60 s lock would then fail every
+    // later test in this file that uses the same chat.
+    const holder = await claimChat(lockEnv, CHAT, { deliveryId: "d-holder", lockTtlMs: 60_000 });
 
     const { harness, result } = await run([buildEnvelope("d-locked", CHAT, { conversation: "halo" })]);
     expect(harness.calls).toHaveLength(0);
     expect(result.retryMessages.map((entry) => entry.msgId)).toEqual(["message-1"]);
     expect(harness.logs).toContain("info:event_locked");
 
-    await releaseChat(lockEnv, CHAT, {});
+    await releaseChat(lockEnv, CHAT, { lockId: holder?.lockId ?? "" });
   });
 
   it("does not record a locked delivery as done, so the retry can continue", async () => {
     const lockEnv = env as unknown as Env;
-    await claimChat(lockEnv, CHAT, { deliveryId: "d-holder", lockTtlMs: 60_000 });
+    const holder = await claimChat(lockEnv, CHAT, { deliveryId: "d-holder", lockTtlMs: 60_000 });
     await run([buildEnvelope("d-locked-2", CHAT, { conversation: "halo" })]);
     const row = await db
       .prepare("SELECT delivery_id FROM processed_events WHERE delivery_id = 'd-locked-2'")
       .first<{ delivery_id: string }>();
     expect(row).toBeNull();
-    await releaseChat(lockEnv, CHAT, {});
+    await releaseChat(lockEnv, CHAT, { lockId: holder?.lockId ?? "" });
   });
 });
 

@@ -58,7 +58,17 @@ export type { Logger } from "./lib/logger";
 
 // ---- bot pipeline ----------------------------------------------------------
 export { ChatCoordinator, claimChat, releaseChat, coordinatorFor, rateLimiterFor } from "./bot/coordinator/chat-lock";
-export type { ClaimRequest, ClaimResponse, CoordinatorState, RateRequest, RateResponse } from "./bot/coordinator/chat-lock";
+export type {
+  ClaimRequest,
+  ClaimResponse,
+  CoordinatorState,
+  RateRequest,
+  RateResponse,
+  ReleaseRequest,
+  ReleaseResponse,
+} from "./bot/coordinator/chat-lock";
+export { RATE_WAIT_ATTEMPTS, RATE_WAIT_MAX_MS, takeRateToken } from "./bot/send-throttle";
+export type { SendThrottleOptions } from "./bot/send-throttle";
 export { filterInbound, messageEventOf, parseTimestamp } from "./bot/filter";
 export type { FilterOptions, FilterResult } from "./bot/filter";
 export { extractBody, unwrapMessage } from "./bot/text";
