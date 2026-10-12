@@ -15,7 +15,7 @@
  * resolve (RFC 2606), so a correctly bound call fails with a DNS error instead.
  */
 import { describe, expect, it } from "vitest";
-import { WuzapiClient, type WuzapiSendResult } from "../src/bot/wuzapi/client";
+import { WuzapiClient, isDataUrl, isHttpUrl, type WuzapiSendResult } from "../src/bot/wuzapi/client";
 import { createLogger } from "../src/lib/logger";
 
 const quiet = createLogger({ handler: "test" }, () => {});
@@ -130,14 +130,14 @@ describe("WuzapiClient requests", () => {
     expect(calls[0]?.url).toBe("https://wuzapi.example.test/chat/send/image");
     expect(calls[0]?.body).toEqual({
       Phone: "628111@s.whatsapp.net",
-      Image: "BASE64",
+      Image: "data:image/jpeg;base64,BASE64",
       Caption: "caption",
       MimeType: "image/jpeg",
     });
     expect(calls[1]?.url).toBe("https://wuzapi.example.test/chat/send/document");
     expect(calls[1]?.body).toEqual({
       Phone: "628111@s.whatsapp.net",
-      Document: "BASE64",
+      Document: "data:application/pdf;base64,BASE64",
       FileName: "nota.pdf",
       Caption: "nota",
       MimeType: "application/pdf",
@@ -189,6 +189,101 @@ describe("WuzapiClient requests", () => {
     expect(Object.keys(result.contacts)).toHaveLength(2);
     expect(calls[0]?.method).toBe("GET");
     expect(calls[0]?.url).toBe("https://wuzapi.example.test/user/contacts");
+  });
+});
+
+describe("media payload normalisation", () => {
+  /**
+   * Regression guard for a permanent-failure bug: wuzapi rejects a bare base64
+   * string with a 400 *before* it decodes anything
+   * (`handlers.go`: SendImage requires a `data:image` prefix, SendDocument
+   * requires `data:`), and a 400 is classified as permanent, so the reply was
+   * dropped instead of retried. Every case below is a payload the bot really
+   * produces (`agent/tools.ts` and `nota/pdf.ts` build raw base64).
+   */
+  it("wraps a bare base64 image in a data:image URL", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    await client(fetchImpl).sendImage("628111@s.whatsapp.net", "AAAA", "cap");
+
+    expect(calls[0]?.body?.["Image"]).toBe("data:image/jpeg;base64,AAAA");
+  });
+
+  it("uses the declared MimeType for a bare base64 image", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    await client(fetchImpl).sendImage("628111@s.whatsapp.net", "AAAA", "cap", { mimeType: "image/png" });
+
+    expect(calls[0]?.body?.["Image"]).toBe("data:image/png;base64,AAAA");
+  });
+
+  it("coerces a non-image MimeType so SendImage's data:image check still passes", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    // An R2 object stored without a real image content type.
+    await client(fetchImpl).sendImage("628111@s.whatsapp.net", "AAAA", "cap", {
+      mimeType: "application/octet-stream",
+    });
+
+    expect(calls[0]?.body?.["Image"]).toBe("data:image/jpeg;base64,AAAA");
+  });
+
+  it("wraps a bare base64 document with the declared MimeType", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    await client(fetchImpl).sendDocument("628111@s.whatsapp.net", "AAAA", "nota.pdf", {
+      mimeType: "application/pdf",
+    });
+
+    expect(calls[0]?.body?.["Document"]).toBe("data:application/pdf;base64,AAAA");
+  });
+
+  it("strips a MimeType parameter, which is invalid inside a data URL", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    // The exact value `nota/pdf.ts` uses for its plain-text fallback.
+    await client(fetchImpl).sendDocument("628111@s.whatsapp.net", "AAAA", "nota.txt", {
+      mimeType: "text/plain; charset=utf-8",
+    });
+
+    expect(calls[0]?.body?.["Document"]).toBe("data:text/plain;base64,AAAA");
+  });
+
+  it("falls back to application/octet-stream for a document with no MimeType", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    await client(fetchImpl).sendDocument("628111@s.whatsapp.net", "AAAA", "berkas.bin");
+
+    expect(calls[0]?.body?.["Document"]).toBe("data:application/octet-stream;base64,AAAA");
+  });
+
+  it("forwards an https URL untouched, because wuzapi fetches it itself", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    const url = "https://media.example.test/produk/kopi.jpg";
+    await client(fetchImpl).sendImage("628111@s.whatsapp.net", url, "cap", { mimeType: "image/jpeg" });
+    await client(fetchImpl).sendDocument("628111@s.whatsapp.net", url, "nota.pdf");
+
+    expect(calls[0]?.body?.["Image"]).toBe(url);
+    expect(calls[1]?.body?.["Document"]).toBe(url);
+  });
+
+  it("forwards an existing data: URL untouched instead of double-wrapping it", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    const dataUrl = "data:image/webp;base64,AAAA";
+    await client(fetchImpl).sendImage("628111@s.whatsapp.net", dataUrl, "cap");
+
+    expect(calls[0]?.body?.["Image"]).toBe(dataUrl);
+  });
+
+  it("keeps the deterministic Id for a media send, so a retry dedupes", async () => {
+    const { calls, fetchImpl } = recorder(() => ok());
+    await client(fetchImpl).sendDocument("628111@s.whatsapp.net", "AAAA", "nota.pdf", { id: "ob-7" });
+
+    expect(calls[0]?.body?.["Id"]).toBe("ob-7");
+    expect(calls[0]?.body?.["Document"]).toBe("data:application/octet-stream;base64,AAAA");
+  });
+
+  it("exposes the prefix helpers the callers share", () => {
+    expect(isDataUrl("data:image/png;base64,AA")).toBe(true);
+    expect(isDataUrl("AAAA")).toBe(false);
+    expect(isHttpUrl("https://x.test/a.png")).toBe(true);
+    expect(isHttpUrl("HTTP://x.test/a.png")).toBe(true);
+    expect(isHttpUrl("data:image/png;base64,AA")).toBe(false);
+    expect(isHttpUrl("ftp://x.test/a.png")).toBe(false);
   });
 });
 

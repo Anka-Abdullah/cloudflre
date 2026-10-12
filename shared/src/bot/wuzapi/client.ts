@@ -50,6 +50,41 @@ export interface WuzapiClientOptions {
 const DEFAULT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 const DEFAULT_TIMEOUT_MS = 20_000;
 
+/**
+ * wuzapi does not accept a bare base64 string for media. Its handlers check the
+ * prefix *before* decoding:
+ *
+ *   handlers.go SendImage    → 400 unless `data:image…` or an http(s) URL
+ *   handlers.go SendDocument → 400 unless `data:…`     or an http(s) URL
+ *
+ * The bot builds media as raw base64 (`agent/tools.ts`, `nota/pdf.ts`), so
+ * without the normalisation below every image, receipt and outbox document was
+ * rejected with a 400 — a *permanent* failure, which the caller correctly
+ * refuses to retry, meaning the message was lost rather than delayed.
+ */
+export function isDataUrl(value: string): boolean {
+  return value.startsWith("data:");
+}
+
+export function isHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+/**
+ * `text/plain; charset=utf-8` → `text/plain`. wuzapi splits on `;` itself and a
+ * parameterised type inside a data URL is not valid.
+ */
+function normaliseMime(mimeType: string | undefined, fallback: string): string {
+  const declared = (mimeType ?? "").split(";")[0]?.trim() ?? "";
+  return declared === "" ? fallback : declared;
+}
+
+/** Wraps raw base64 in a data URL; leaves a data:/http(s) value untouched. */
+export function toDataUrl(value: string, mimeType: string | undefined, fallbackMime: string): string {
+  if (isDataUrl(value) || isHttpUrl(value)) return value;
+  return `data:${normaliseMime(mimeType, fallbackMime)};base64,${value}`;
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -106,9 +141,16 @@ export class WuzapiClient {
     caption: string,
     options: { mimeType?: string; id?: string } = {},
   ): Promise<WuzapiSendResult> {
+    // SendImage is stricter than SendDocument: it requires the literal
+    // `data:image` prefix. A caller that omits MimeType, or an R2 object stored
+    // with a non-image content type, would otherwise be normalised into
+    // `data:application/octet-stream;base64,…` and rejected with a 400 that no
+    // retry can fix — so a non-image type falls back to the image default.
+    const declared = normaliseMime(options.mimeType, "image/jpeg");
+    const imageMime = declared.startsWith("image/") ? declared : "image/jpeg";
     return await this.call("/chat/send/image", {
       Phone: phone,
-      Image: image,
+      Image: toDataUrl(image, imageMime, "image/jpeg"),
       Caption: caption,
       ...(options.mimeType ? { MimeType: options.mimeType } : {}),
       ...(options.id ? { Id: options.id } : {}),
@@ -123,7 +165,7 @@ export class WuzapiClient {
   ): Promise<WuzapiSendResult> {
     return await this.call("/chat/send/document", {
       Phone: phone,
-      Document: document,
+      Document: toDataUrl(document, options.mimeType, "application/octet-stream"),
       FileName: fileName,
       ...(options.caption ? { Caption: options.caption } : {}),
       ...(options.mimeType ? { MimeType: options.mimeType } : {}),
