@@ -2,9 +2,6 @@
 /**
  * Writes a per-number `knowledge/ongkir-policy.json` for SANDBOX use.
  *
- *   pnpm run assign-ongkir -- --number 6281234567890 --ratio 0.5 --seed 20261010
- *   pnpm run assign-ongkir -- --number 6281234567890 --ratio 0.3 --excluded-ratio 0.2
- *   pnpm run assign-ongkir -- --number 6281234567890 \
  *     --knowledge /path/to/knowledge.txt --out /tmp/policy.json
  *
  * Why this exists: the real catalogue has no `Ongkir:` line at all, so with an
@@ -115,7 +112,7 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
 
   if (options.number === null || !E164.test(options.number)) {
-    throw new Error("--number is required, for example: --number 6281234567890");
+    throw new Error("--number is required, for example: --number ");
   }
   assertRatio("--ratio", options.ratio);
   assertRatio("--excluded-ratio", options.excludedRatio);

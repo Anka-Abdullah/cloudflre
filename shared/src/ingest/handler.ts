@@ -75,6 +75,19 @@ function isJsonContentType(contentType: string): boolean {
   return contentType === "application/json" || contentType.endsWith("+json");
 }
 
+/**
+ * A stable, non-reversible label for a request path.
+ *
+ * Used instead of the raw pathname because `POST /ingest/<token>` carries the
+ * shared secret *in the path*: logging it would copy the credential into every
+ * log sink, alert payload and DLQ archive. Twelve hex characters are enough to
+ * tell two senders apart and far too few to recover the token from.
+ */
+async function pathFingerprint(pathname: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pathname));
+  return bytesToHex(new Uint8Array(digest)).slice(0, 12);
+}
+
 function r2KeyFor(slug: string, contentType: string, at: Date, id: string): string {
   const yyyy = String(at.getUTCFullYear());
   const mm = String(at.getUTCMonth() + 1).padStart(2, "0");
@@ -229,11 +242,18 @@ interface PointerContext {
   sha256: string;
   scan: ScanResult | null;
   formMeta?: { userID: string | null; instanceName: string | null } | undefined;
+  /**
+   * Routing metadata that was already parsed. The inline path sets this when it
+   * has to offload an event whose *envelope* did not fit: the payload is then
+   * only in R2, but type/userID/instanceName are known exactly and must not be
+   * re-derived from a scan.
+   */
+  parsed?: { type: string | null; userID: string | null; instanceName: string | null } | undefined;
   hmacVerified: boolean;
 }
 
 function pointerEnvelope(context: PointerContext): EnvelopeV1 {
-  const { config, request, receivedAt, contentType, key, size, sha256, scan, formMeta, hmacVerified } = context;
+  const { config, request, receivedAt, contentType, key, size, sha256, scan, formMeta, parsed, hmacVerified } = context;
   const { fields, omitted } = fieldsWithinBudget(scan);
   return {
     v: ENVELOPE_VERSION,
@@ -243,9 +263,9 @@ function pointerEnvelope(context: PointerContext): EnvelopeV1 {
     contentType,
     hmac: hmacField(config, hmacVerified),
     event: {
-      type: str(fields?.["type"]),
-      userID: str(fields?.["userID"]) ?? formMeta?.userID ?? null,
-      instanceName: str(fields?.["instanceName"]) ?? formMeta?.instanceName ?? null,
+      type: parsed?.type ?? str(fields?.["type"]),
+      userID: parsed?.userID ?? str(fields?.["userID"]) ?? formMeta?.userID ?? null,
+      instanceName: parsed?.instanceName ?? str(fields?.["instanceName"]) ?? formMeta?.instanceName ?? null,
       payload: null,
     },
     media: {
@@ -278,6 +298,90 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
   const url = new URL(request.url);
   const receivedAt = now();
 
+  /**
+   * Enqueues an envelope, offloading the raw body to R2 first when the envelope
+   * would not fit in a queue message (WP-4C).
+   *
+   * The inline path used to trust that a parsed event fits, but fitting is not a
+   * property of the payload — a text message just under INLINE_MAX_BYTES still
+   * serialises into more than ENVELOPE_MAX_BYTES once the envelope wrapper, the
+   * HMAC block and the source block are added, and Cloudflare rejects a queue
+   * message over 128 KB outright. Offloading keeps the event and hands the
+   * consumer the same pointer shape the oversized path already produces.
+   *
+   * The queue write is also where an R2 object can become an orphan: if `send`
+   * fails after a successful `put`, nothing will ever read the object, so it is
+   * deleted rather than left behind (WP-4D).
+   */
+  const enqueueOrOffload = async (
+    envelope: EnvelopeV1,
+    source: {
+      bytes: Uint8Array;
+      sha256: string;
+      scan: ScanResult | null;
+      formMeta?: { userID: string | null; instanceName: string | null } | undefined;
+      parsed?: { type: string | null; userID: string | null; instanceName: string | null } | undefined;
+    },
+  ): Promise<{ ok: true; envelope: EnvelopeV1; r2Key: string | null } | { ok: false; error: unknown }> => {
+    let outgoing = envelope;
+    let r2Key: string | null = null;
+
+    const serialised = JSON.stringify(envelope);
+    if (serialised.length > config.envelopeMaxBytes) {
+      const key = r2KeyFor(config.slug, contentType, receivedAt, randomUUID());
+      try {
+        await putObject(key, source.bytes.buffer as ArrayBuffer, {
+          httpMetadata: { contentType },
+          customMetadata: {
+            slug: config.slug,
+            receivedAt: receivedAt.toISOString(),
+            contentType,
+            offloaded: "envelope-too-large",
+          },
+        });
+      } catch (error) {
+        log.error("ingest_storage_failed", { error: String(error), key, size: source.bytes.byteLength });
+        return { ok: false, error };
+      }
+
+      r2Key = key;
+      outgoing = pointerEnvelope({
+        config,
+        request,
+        receivedAt,
+        contentType,
+        key,
+        size: source.bytes.byteLength,
+        sha256: source.sha256,
+        scan: source.scan,
+        ...(source.formMeta ? { formMeta: source.formMeta } : {}),
+        ...(source.parsed ? { parsed: source.parsed } : {}),
+        hmacVerified,
+      });
+      log.warn("ingest_envelope_offloaded", {
+        deliveryId: envelope.deliveryId,
+        envelopeBytes: serialised.length,
+        limit: config.envelopeMaxBytes,
+        size: source.bytes.byteLength,
+        r2Key: key,
+      });
+    }
+
+    try {
+      await sendEnvelope(outgoing);
+    } catch (error) {
+      if (r2Key !== null) {
+        try {
+          await deleteObject(r2Key);
+        } catch {
+          // Best effort: an orphaned object is harmless, a lost event is not.
+        }
+      }
+      return { ok: false, error };
+    }
+    return { ok: true, envelope: outgoing, r2Key };
+  };
+
   // 1. Shared secret in the URL path. This is the credential pasted into the
   //    wuzapi dashboard, because wuzapi cannot send custom headers.
   const token = ingestTokenFromPath(url.pathname);
@@ -286,7 +390,16 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
     return json(500, { error: "INGEST_TOKEN is not configured" });
   }
   if (token === null || !(await timingSafeEqualString(token, config.ingestToken))) {
-    log.warn("ingest_unauthorized", { path: url.pathname, ip: request.headers.get("cf-connecting-ip") });
+    // The path *is* the credential, so it must never reach a log line. A short
+    // fingerprint keeps the line useful — it tells two wrong URLs apart, and lets
+    // an operator confirm which deployment a sender is aiming at — without
+    // copying the secret into a log sink, an alert or an R2 archive.
+    log.warn("ingest_unauthorized", {
+      route: "ingest",
+      pathHash: await pathFingerprint(url.pathname),
+      pathLength: url.pathname.length,
+      ip: request.headers.get("cf-connecting-ip"),
+    });
     return json(401, { error: "invalid ingest token" });
   }
 
@@ -300,19 +413,58 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
     return json(415, { error: `unsupported content type ${JSON.stringify(contentType)}` });
   }
 
-  // 3. Signature pre-checks. A missing signature is refused before the body is
-  //    read, which keeps misconfigured senders cheap to reject.
+  // 3. Signature pre-checks, before the body is read so a misconfigured sender is
+  //    cheap to reject. The three modes are deliberately distinct (WP-4A):
+  //
+  //      strict   a webhook without a signature is refused outright
+  //      optional no signature is accepted and recorded as `absent`; a signature
+  //               that *is* present must still verify
+  //      off      the header is not looked at at all
   const signature = request.headers.get("x-hmac-signature");
-  if (config.hmacMode === "strict" && !signature) {
+  const shouldVerify = config.hmacMode !== "off" && signature !== null;
+
+  if (config.hmacMode === "strict" && signature === null) {
     log.warn("ingest_signature_missing", { ip: request.headers.get("cf-connecting-ip") });
     return json(403, { error: "x-hmac-signature header is required" });
   }
-  if (config.hmacMode !== "off" && config.hmacKeys.length === 0) {
+  if (shouldVerify && config.hmacKeys.length === 0) {
+    // A signature was presented but there is no key to check it against. Passing
+    // it through would stamp the envelope `verified: false` on a request nobody
+    // could authenticate, which is exactly what the mode was meant to prevent.
     log.error("ingest_misconfigured", { reason: "WUZAPI_HMAC_KEYS secret is not set" });
     return json(500, { error: "WUZAPI_HMAC_KEYS is not configured" });
   }
-  const shouldVerify = config.hmacMode !== "off" && signature !== null;
   const hmacVerified = shouldVerify;
+
+  // 3b. Hard ceiling on the upload, decided from the header alone (WP-4C). This
+  //     runs before the body is read on purpose: a runaway upload is refused in
+  //     one round trip, instead of being streamed into R2 until the runtime cuts
+  //     it off — which would leave a truncated object and a wasted transfer.
+  const declaredHeader = request.headers.get("content-length");
+  const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
+  if (Number.isFinite(declared) && declared > config.mediaMaxBytes) {
+    log.warn("ingest_payload_rejected", { reason: "MEDIA_MAX_BYTES exceeded", limit: config.mediaMaxBytes, declared });
+    try {
+      await request.body?.cancel("payload rejected");
+    } catch {
+      // Cancelling a rejected body is best effort.
+    }
+    try {
+      await sendDlq({
+        v: ENVELOPE_VERSION,
+        failedAt: receivedAt.toISOString(),
+        stage: "ingest",
+        reason: `Content-Length ${declared} exceeds MEDIA_MAX_BYTES=${config.mediaMaxBytes}`,
+        queue: "ingest",
+        messageId: "-",
+        attempts: 0,
+        envelope: { contentType, declared },
+      });
+    } catch (error) {
+      log.error("ingest_dlq_record_failed", { error: String(error) });
+    }
+    return json(413, { error: `payload exceeds MEDIA_MAX_BYTES=${config.mediaMaxBytes}` });
+  }
 
   const body = request.body;
   if (!body) {
@@ -356,20 +508,34 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
       },
       source: sourceOf(config, request, bytes.byteLength),
     };
-    try {
-      await sendEnvelope(envelope);
-    } catch (error) {
-      log.error("ingest_enqueue_failed", { error: String(error), deliveryId, kind: envelope.kind });
+
+    // A parsed event can still be too big for a queue message, so the send goes
+    // through the same offload path the oversized bodies use.
+    const queued = await enqueueOrOffload(envelope, {
+      bytes,
+      sha256: deliveryId,
+      scan: await scanJsonSafely(bytes, contentType, config, log),
+      ...(isJsonContentType(contentType) ? {} : { formMeta: metadataFromFormPrefix(bytes) }),
+      parsed: { type: parsed.eventType, userID: parsed.userID, instanceName: parsed.instanceName },
+    });
+    if (!queued.ok) {
+      log.error("ingest_enqueue_failed", { error: String(queued.error), deliveryId, kind: envelope.kind });
       return json(503, { error: "queue write failed, retry" });
     }
     log.info("ingest_queued", {
       deliveryId,
-      kind: envelope.kind,
-      eventType: envelope.event.type,
-      userID: envelope.event.userID,
+      kind: queued.envelope.kind,
+      eventType: queued.envelope.event.type,
+      userID: queued.envelope.event.userID,
       size: bytes.byteLength,
+      r2Key: queued.r2Key,
     });
-    return json(202, { ok: true, deliveryId, kind: envelope.kind });
+    return json(202, {
+      ok: true,
+      deliveryId,
+      kind: queued.envelope.kind,
+      ...(queued.r2Key === null ? {} : { r2Key: queued.r2Key }),
+    });
   }
 
   // 5. Oversized payload when R2 offload is disabled.
@@ -400,6 +566,34 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
   const declaredHeader = request.headers.get("content-length");
   const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
   const hasDeclaredLength = Number.isFinite(declared) && declared > config.inlineMaxBytes;
+
+  // 5b. A body that announces more than MEDIA_MAX_BYTES is refused up front, so
+  //     a runaway upload is rejected in one round trip instead of being streamed
+  //     into R2 until the runtime truncates it. Checked before the buffered path
+  //     too, where a declared length is present by definition.
+  if (hasDeclaredLength && declared > config.mediaMaxBytes) {
+    log.warn("ingest_payload_rejected", { reason: "MEDIA_MAX_BYTES exceeded", limit: config.mediaMaxBytes, declared });
+    try {
+      await read.remainder?.cancel("payload rejected");
+    } catch {
+      // Cancelling a rejected body is best effort.
+    }
+    try {
+      await sendDlq({
+        v: ENVELOPE_VERSION,
+        failedAt: receivedAt.toISOString(),
+        stage: "ingest",
+        reason: `Content-Length ${declared} exceeds MEDIA_MAX_BYTES=${config.mediaMaxBytes}`,
+        queue: "ingest",
+        messageId: "-",
+        attempts: 0,
+        envelope: { contentType, prefixSize: read.prefix.byteLength, declared },
+      });
+    } catch (error) {
+      log.error("ingest_dlq_record_failed", { error: String(error) });
+    }
+    return json(413, { error: `payload exceeds MEDIA_MAX_BYTES=${config.mediaMaxBytes}` });
+  }
 
   // 6. Oversized without a usable Content-Length: buffer up to the cap. R2
   //    requires a known length for streamed puts, so without one the only way to
@@ -463,20 +657,32 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
       formMeta: isJsonContentType(contentType) ? undefined : metadataFromFormPrefix(read.prefix),
     });
 
-    try {
-      await sendEnvelope(envelope);
-    } catch (error) {
-      log.error("ingest_enqueue_failed", { error: String(error), deliveryId: sha256, kind: envelope.kind });
+    const queued = await enqueueOrOffload(envelope, {
+      bytes,
+      sha256,
+      scan,
+      ...(isJsonContentType(contentType) ? {} : { formMeta: metadataFromFormPrefix(read.prefix) }),
+    });
+    if (!queued.ok) {
+      log.error("ingest_enqueue_failed", { error: String(queued.error), deliveryId: sha256, kind: envelope.kind });
+      // The object was already stored for an event that will now never be
+      // consumed, and wuzapi will retry the whole request, so leaving it behind
+      // would leak one object per failed attempt.
+      try {
+        await deleteObject(key);
+      } catch {
+        // Best effort: an orphaned object is harmless, a lost event is not.
+      }
       return json(503, { error: "queue write failed, retry" });
     }
     log.info("ingest_queued", {
       deliveryId: sha256,
-      kind: envelope.kind,
+      kind: queued.envelope.kind,
       size: bytes.byteLength,
-      r2Key: key,
+      r2Key: queued.r2Key ?? key,
       path: "buffered-oversize",
     });
-    return json(202, { ok: true, deliveryId: sha256, kind: envelope.kind, r2Key: key });
+    return json(202, { ok: true, deliveryId: sha256, kind: queued.envelope.kind, r2Key: queued.r2Key ?? key });
   }
 
   // 7. Oversized with a known length: one streaming pass into R2 through a
@@ -644,6 +850,13 @@ export async function handleIngest(request: Request, options: IngestOptions): Pr
     await sendEnvelope(envelope);
   } catch (error) {
     log.error("ingest_enqueue_failed", { error: String(error), deliveryId: sha256, kind: envelope.kind });
+    // The streamed object is already in R2 but no consumer will ever see it,
+    // because the only reference to it was the message that failed to send.
+    try {
+      await deleteObject(key);
+    } catch {
+      // Best effort: an orphaned object is harmless, a lost event is not.
+    }
     return json(503, { error: "queue write failed, retry" });
   }
 
@@ -672,14 +885,24 @@ async function drainWithCap(
       if (done) break;
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
-      if (total > cap) return { ok: false, read: total };
+      if (total > cap) {
+        // Cancelling releases the sender instead of letting it push the rest of a
+        // body the worker has already decided to refuse. Without this the upload
+        // keeps being buffered at the edge for the whole transfer.
+        try {
+          await reader.cancel("payload exceeds cap");
+        } catch {
+          // Cancelling is best effort; the 413 is returned either way.
+        }
+        return { ok: false, read: total };
+      }
       chunks.push(value.slice());
     }
   } finally {
     try {
       reader.releaseLock();
     } catch {
-      // The reader is already released when the stream errored.
+      // The reader is already released when the stream errored or was cancelled.
     }
   }
   return { ok: true, bytes: concat(chunks, total) };

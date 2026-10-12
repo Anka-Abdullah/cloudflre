@@ -47,7 +47,9 @@ export async function handleBotBatch(batch: MessageBatch<unknown>, options: BotB
       const record: DlqRecord = {
         v: ENVELOPE_VERSION,
         failedAt: now().toISOString(),
-        stage: "relay",
+        // The bot's own stage. This used to say "relay", which made a bot failure
+        // indistinguishable from a relay failure in the alert and the archive.
+        stage: "bot",
         reason,
         queue: batch.queue,
         messageId: message.id,
@@ -62,8 +64,10 @@ export async function handleBotBatch(batch: MessageBatch<unknown>, options: BotB
     };
 
     if (!isEnvelopeV1(body)) {
+      // Not retryable by definition: the same bytes will fail the same way, so it
+      // is archived once and acknowledged instead of consuming the retry budget.
       log.warn("bot_poison_message", { messageId: message.id });
-      await archive("message body is not an envelope v1", body);
+      await archive("invalid envelope", body);
       message.ack();
       continue;
     }

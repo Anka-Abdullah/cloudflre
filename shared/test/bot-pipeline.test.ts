@@ -13,7 +13,7 @@ import { env } from "cloudflare:workers";
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, type Env, type InstanceConfig } from "../src/config";
-import { ENVELOPE_VERSION, type EnvelopeV1 } from "../src/envelope";
+import { ENVELOPE_VERSION, type DlqRecord, type EnvelopeV1 } from "../src/envelope";
 import { handleBotBatch } from "../src/bot/queue/router";
 import { claimChat, releaseChat } from "../src/bot/coordinator/chat-lock";
 import type { OutboundMessage, ReplyContext } from "../src/bot/types";
@@ -392,6 +392,75 @@ describe("filtering at the queue boundary", () => {
     const result = await getQueueResult(batch, ctx);
     expect(result.explicitAcks).toEqual(["poison-1"]);
     expect(dlq).toHaveLength(1);
+  });
+
+  /**
+   * WP-4E. A body that looks like an envelope but is missing a required part used
+   * to pass the old two-field check, blow up inside the handler, and be classified
+   * as a *transient* failure — so it was retried until the queue gave up, and only
+   * then archived. Rejecting it up front makes the poison message visible on the
+   * first attempt instead of the fourth.
+   */
+  it.each([
+    ["wrong version", { v: 99, kind: "event", deliveryId: "d", event: { type: "Message", userID: null, instanceName: null, payload: null } }],
+    ["unknown kind", { v: 1, kind: "nonsense", deliveryId: "d", event: { type: "Message", userID: null, instanceName: null, payload: null } }],
+    ["no delivery id", { v: 1, kind: "event", event: { type: "Message", userID: null, instanceName: null, payload: null } }],
+    ["empty delivery id", { v: 1, kind: "event", deliveryId: "", event: { type: "Message", userID: null, instanceName: null, payload: null } }],
+    ["no event block", { v: 1, kind: "event", deliveryId: "d" }],
+    ["event block is not an object", { v: 1, kind: "event", deliveryId: "d", event: "Message" }],
+    ["event without a payload key", { v: 1, kind: "event", deliveryId: "d", event: { type: "Message", userID: null, instanceName: null } }],
+    ["event with a mistyped field", { v: 1, kind: "event", deliveryId: "d", event: { type: 7, userID: null, instanceName: null, payload: null } }],
+  ])("archives a malformed envelope (%s) once, without retrying", async (_label, body) => {
+    const batch = createMessageBatch("wuzip-shared-test-events", [
+      { id: "poison-2", timestamp: new Date(), body, attempts: 1 },
+    ]);
+    const ctx = createExecutionContext();
+    const dlq: DlqRecord[] = [];
+
+    await handleBotBatch(batch, {
+      env: env as unknown as Env,
+      config: configFor(env as unknown as Env, "on"),
+      deps: { sendDlq: async (record) => void dlq.push(record), log: quietLogger() },
+    });
+
+    const result = await getQueueResult(batch, ctx);
+    expect(result.explicitAcks).toEqual(["poison-2"]);
+    expect(result.retryMessages).toEqual([]);
+    expect(dlq).toHaveLength(1);
+    expect(dlq[0]?.stage).toBe("bot");
+    expect(dlq[0]?.reason).toContain("invalid envelope");
+  });
+
+  it("archives an unknown-but-well-formed kind to the bot stage", async () => {
+    // `kind` is validated by the envelope check itself, so this covers the branch
+    // that would otherwise fall through the router's dispatch chain.
+    const batch = createMessageBatch("wuzip-shared-test-events", [
+      {
+        id: "poison-3",
+        timestamp: new Date(),
+        body: {
+          v: 1,
+          kind: "event",
+          deliveryId: "d-unknown",
+          event: { type: "Message", userID: null, instanceName: null, payload: { type: "NotAMessage" } },
+        },
+        attempts: 1,
+      },
+    ]);
+    const ctx = createExecutionContext();
+    const dlq: DlqRecord[] = [];
+
+    await handleBotBatch(batch, {
+      env: env as unknown as Env,
+      config: configFor(env as unknown as Env, "on"),
+      deps: { sendDlq: async (record) => void dlq.push(record), log: quietLogger() },
+    });
+
+    // A well-formed envelope whose *event* is not a customer message is filtered,
+    // not archived — the point is that it reaches the pipeline at all.
+    const result = await getQueueResult(batch, ctx);
+    expect(result.explicitAcks).toEqual(["poison-3"]);
+    expect(dlq).toHaveLength(0);
   });
 });
 

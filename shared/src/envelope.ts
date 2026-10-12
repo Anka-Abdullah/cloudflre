@@ -22,7 +22,18 @@ export const ENVELOPE_VERSION = 1;
  * and every existing deployment already carry, so they stay the canonical names
  * for wuzapi-sourced traffic rather than being renamed.
  */
-export type EnvelopeKind = "event" | "media-pointer" | "wuzapi.event" | "payment.event" | "outbox.tick";
+/**
+ * Every kind a consumer is allowed to see, as a value rather than only as a type
+ * — a queue consumer has to validate an untrusted body at runtime, and a type
+ * alone cannot do that.
+ */
+export const ENVELOPE_KINDS = ["event", "media-pointer", "wuzapi.event", "payment.event", "outbox.tick"] as const;
+
+export type EnvelopeKind = (typeof ENVELOPE_KINDS)[number];
+
+export function isEnvelopeKind(value: unknown): value is EnvelopeKind {
+  return typeof value === "string" && (ENVELOPE_KINDS as readonly string[]).includes(value);
+}
 
 export function isWuzapiEventKind(kind: string): boolean {
   return kind === "event" || kind === "media-pointer" || kind === "wuzapi.event";
@@ -83,7 +94,12 @@ export interface EnvelopeV1 {
 export interface DlqRecord {
   v: typeof ENVELOPE_VERSION;
   failedAt: string;
-  stage: "ingest" | "relay" | "dlq-consumer";
+  /**
+   * Where the message died. `bot` is the queue consumer's own stage (it used to
+   * borrow `relay`, which made a bot failure indistinguishable from a relay
+   * failure in the alert and in the R2 archive).
+   */
+  stage: "ingest" | "relay" | "bot" | "dlq-consumer";
   reason: string;
   queue: string;
   messageId: string;
@@ -91,8 +107,30 @@ export interface DlqRecord {
   envelope: unknown;
 }
 
+/**
+ * Runtime validation of an untrusted queue body.
+ *
+ * Deliberately strict. The consumer cannot repair a malformed envelope, and a
+ * loose check has a specific failure mode: a body that passes here but is missing
+ * `event` throws inside the handler, is classified as a transient failure, and is
+ * retried until it lands in the DLQ anyway — burning the retry budget and hiding
+ * the real cause. Rejecting it once, up front, makes the poison message visible
+ * immediately.
+ */
 export function isEnvelopeV1(value: unknown): value is EnvelopeV1 {
   if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Partial<EnvelopeV1>;
-  return candidate.v === ENVELOPE_VERSION && typeof candidate.deliveryId === "string";
+  const candidate = value as Record<string, unknown>;
+
+  if (candidate["v"] !== ENVELOPE_VERSION) return false;
+  if (typeof candidate["deliveryId"] !== "string" || candidate["deliveryId"] === "") return false;
+  if (!isEnvelopeKind(candidate["kind"])) return false;
+
+  const event = candidate["event"];
+  if (typeof event !== "object" || event === null) return false;
+  const fields = event as Record<string, unknown>;
+  const nullableString = (key: string): boolean => fields[key] === null || typeof fields[key] === "string";
+
+  // `payload` must be present (it is explicitly null for an offloaded media
+  // pointer), but its shape is the producer's business.
+  return nullableString("type") && nullableString("userID") && nullableString("instanceName") && "payload" in fields;
 }

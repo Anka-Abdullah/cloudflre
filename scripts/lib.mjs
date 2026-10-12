@@ -28,7 +28,7 @@ export function parseNumberArg(argv) {
     if (argv[i] === "--number" || argv[i] === "-n") number = argv[++i];
     else if (!argv[i].startsWith("-") && number === null) number = argv[i];
   }
-  if (!number) throw new Error("--number is required, for example: --number 6281234567890");
+  if (!number) throw new Error("--number is required");
   const slug = String(number).replace(/[^0-9]/g, "");
   if (!E164.test(slug)) throw new Error(`"${number}" is not a valid E.164 number without '+'`);
   return slug;

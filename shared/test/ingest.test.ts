@@ -292,6 +292,258 @@ describe("ingest: queue failures", () => {
   });
 });
 
+/**
+ * WP-4A. `optional` means the signature is not required — not that the keyring is
+ * optional. Those are two different settings and the old code conflated them: with
+ * no WUZAPI_HMAC_KEYS it answered 500 even for a webhook that carried no
+ * signature, so a number deliberately running unauthenticated could not receive
+ * anything at all.
+ */
+describe("ingest: HMAC optional without a keyring (WP-4A)", () => {
+  const body = fixture("json-event-message");
+  const noKeys = { ...config, hmacMode: "optional" as const, hmacKeys: [] };
+
+  it("accepts a signature-less webhook and records it as absent", async () => {
+    const test = harness();
+    const response = await callIngest(
+      test,
+      test.request(body.body, { headers: { "content-type": "application/json" } }),
+      { config: noKeys },
+    );
+    expect(response.status).toBe(202);
+    expect(test.sent[0]?.hmac).toEqual({ verified: false, reason: "absent" });
+  });
+
+  it("still refuses a signature it has no key to check", async () => {
+    // Accepting this would stamp an unverifiable request as if it had been
+    // checked, which is the one outcome the mode exists to prevent.
+    const test = harness();
+    const response = await callIngest(
+      test,
+      test.request(body.body, { headers: { "content-type": "application/json", "x-hmac-signature": "deadbeef" } }),
+      { config: noKeys },
+    );
+    expect(response.status).toBe(500);
+    expect(test.sent).toHaveLength(0);
+  });
+
+  it("ignores a stray signature entirely in off mode", async () => {
+    // `off` must not depend on the keyring either: an instance that never
+    // configured HMAC has to keep working even if the sender adds the header.
+    const test = harness();
+    const response = await callIngest(
+      test,
+      test.request(body.body, { headers: { "content-type": "application/json", "x-hmac-signature": "deadbeef" } }),
+      { config: { ...config, hmacMode: "off", hmacKeys: [] } },
+    );
+    expect(response.status).toBe(202);
+    expect(test.sent[0]?.hmac).toEqual({ verified: false, reason: "disabled" });
+  });
+});
+
+/**
+ * WP-4B. `POST /ingest/<token>` carries the shared secret *in the path*, so a log
+ * line that echoes the pathname copies a live credential into every log sink,
+ * alert payload and DLQ archive it touches.
+ */
+describe("ingest: token redaction (WP-4B)", () => {
+  it("never writes the ingest token to the log, even when it rejects the request", async () => {
+    const test = harness();
+    const body = fixture("json-event-message");
+    const lines: string[] = [];
+    const record = (event: string, fields?: Record<string, unknown>): void => {
+      lines.push(`${event} ${JSON.stringify(fields ?? {})}`);
+    };
+
+    const response = await handleIngest(
+      test.request(body.body, { token: "super-secret-token-value", headers: { "content-type": "application/json" } }),
+      {
+        env: env as unknown as Env,
+        config,
+        deps: {
+          log: { debug: () => {}, info: record, warn: record, error: record },
+          now: () => new Date("2026-10-10T07:15:00.000Z"),
+        },
+      },
+    );
+
+    expect(response.status).toBe(401);
+    const output = lines.join("\n");
+    expect(output).toContain("ingest_unauthorized");
+    expect(output).not.toContain("super-secret-token-value");
+    expect(output).not.toContain(TOKEN);
+    // A fingerprint is still there, so two wrong URLs remain distinguishable.
+    expect(output).toMatch(/"pathHash":"[0-9a-f]{12}"/);
+  });
+
+  it("does not leak the token on a successful ingest either", async () => {
+    const test = harness();
+    const body = fixture("json-event-message");
+    const lines: string[] = [];
+    const record = (event: string, fields?: Record<string, unknown>): void => {
+      lines.push(`${event} ${JSON.stringify(fields ?? {})}`);
+    };
+
+    await handleIngest(
+      test.request(body.body, { headers: { "content-type": "application/json", "x-hmac-signature": body.signature } }),
+      {
+        env: env as unknown as Env,
+        config,
+        deps: {
+          log: { debug: () => {}, info: record, warn: record, error: record },
+          send: async (envelope) => void test.sent.push(envelope),
+        },
+      },
+    );
+
+    expect(test.sent).toHaveLength(1);
+    expect(lines.join("\n")).not.toContain(TOKEN);
+  });
+});
+
+/**
+ * WP-4C. Two caps that did not exist: one for the whole upload, one for the
+ * serialised envelope. Without them a declared length above the media ceiling was
+ * streamed into R2 until the runtime cut it off, and an inline event that
+ * serialised past the 128 KB queue limit was rejected by the queue and lost.
+ */
+describe("ingest: size caps (WP-4C)", () => {
+  it("answers 413 and records the drop when Content-Length exceeds MEDIA_MAX_BYTES", async () => {
+    const test = harness();
+    const response = await callIngest(
+      test,
+      test.request("x".repeat(2_000), {
+        headers: { "content-type": "application/json", "x-hmac-signature": "deadbeef" },
+        contentLength: 5_000,
+      }),
+      { config: { ...config, mediaMaxBytes: 4_000 } },
+    );
+
+    expect(response.status).toBe(413);
+    expect(test.sent).toHaveLength(0);
+    expect(test.stored.size).toBe(0);
+    expect(test.dlq).toHaveLength(1);
+    expect(test.dlq[0]?.stage).toBe("ingest");
+    expect(test.dlq[0]?.reason).toContain("MEDIA_MAX_BYTES");
+  });
+
+  it("offloads an inline event whose envelope does not fit, instead of losing it", async () => {
+    const test = harness();
+    // A body comfortably inside INLINE_MAX_BYTES (90 000) but whose *envelope*
+    // exceeds the cap once the wrapper, the HMAC block and the source block are
+    // added — the case the inline path used to trust could not happen.
+    const big = JSON.stringify({
+      type: "Message",
+      userID: "1",
+      instanceName: "nomor-1",
+      event: { Info: { Chat: "6281234567890@s.whatsapp.net", ID: "3EB0BIGINLINE" }, conversation: "y".repeat(15_000) },
+    });
+    expect(big.length).toBeGreaterThan(12_000);
+    expect(big.length).toBeLessThan(config.inlineMaxBytes);
+
+    const response = await callIngest(
+      test,
+      test.request(big, { headers: { "content-type": "application/json" } }),
+      { config: { ...config, hmacMode: "off", envelopeMaxBytes: 12_000 } },
+    );
+
+    expect(response.status).toBe(202);
+    expect(test.sent).toHaveLength(1);
+    const envelope = test.sent[0] as EnvelopeV1;
+    // The raw body is in R2 and the queue carries a pointer to it…
+    expect(envelope.kind).toBe("media-pointer");
+    expect(envelope.media?.size).toBe(big.length);
+    expect(test.stored.has(envelope.media?.r2Key ?? "")).toBe(true);
+    // …while the routing metadata survives, so the pipeline can still answer
+    // without fetching the object.
+    expect(envelope.event.type).toBe("Message");
+    expect(envelope.event.userID).toBe("1");
+    expect(envelope.event.instanceName).toBe("nomor-1");
+    expect(envelope.deliveryId).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("keeps a normal event inline and does not touch R2", async () => {
+    const test = harness();
+    const response = await callIngest(test, test.request(fixture("json-event-message").body, {
+      headers: { "content-type": "application/json" },
+    }), { config: { ...config, hmacMode: "off" } });
+
+    expect(response.status).toBe(202);
+    expect(test.sent[0]?.kind).toBe("event");
+    expect(test.stored.size).toBe(0);
+  });
+});
+
+/**
+ * WP-4D. An R2 object whose only reference was a queue message that failed to send
+ * can never be read by anyone, and wuzapi retries the whole request — so leaving
+ * it behind leaks one object per failed attempt.
+ */
+describe("ingest: R2 orphan cleanup (WP-4D)", () => {
+  it("deletes the streamed object when the queue write fails", async () => {
+    const test = harness();
+    const base64 = "A".repeat(150_000);
+    const eventJson = JSON.stringify({
+      base64,
+      event: { Info: { Chat: "6281234567890@s.whatsapp.net", ID: "3EB0ORPHAN" }, Message: { imageMessage: {} } },
+    });
+    const form = `instanceName=nomor-1&jsonData=${encodeURIComponent(eventJson)}&userID=1`;
+
+    const response = await callIngest(
+      test,
+      test.request(form, { headers: { "content-type": "application/x-www-form-urlencoded" } }),
+      { failSend: true },
+    );
+
+    expect(response.status).toBe(503);
+    expect(test.sent).toHaveLength(0);
+    // The object was written, then removed again — nothing is left orphaned.
+    expect(test.deleted).toHaveLength(1);
+    expect(test.stored.size).toBe(0);
+  });
+
+  it("deletes the buffered object when the queue write fails, and reports no r2Key", async () => {
+    const test = harness();
+    const eventJson = JSON.stringify({
+      base64: "A".repeat(60_000),
+      event: { Info: { Chat: "6281234567890@s.whatsapp.net", ID: "3EB0ORPHAN2" }, Message: { imageMessage: {} } },
+    });
+    const form = `instanceName=nomor-1&jsonData=${encodeURIComponent(eventJson)}&userID=1`;
+
+    const response = await callIngest(
+      test,
+      // No Content-Length, so the buffered path handles it.
+      test.request(form, { headers: { "content-type": "application/x-www-form-urlencoded" }, contentLength: "none" }),
+      { failSend: true },
+    );
+
+    expect(response.status).toBe(503);
+    // Only the streaming path stored before sending; the buffered path stores
+    // first too, so it must clean up as well.
+    expect(test.stored.size).toBe(0);
+    expect(test.deleted.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("keeps the object when the queue write succeeds", async () => {
+    const test = harness();
+    const eventJson = JSON.stringify({
+      base64: "A".repeat(150_000),
+      event: { Info: { Chat: "6281234567890@s.whatsapp.net", ID: "3EB0KEEP" }, Message: { imageMessage: {} } },
+    });
+    const form = `instanceName=nomor-1&jsonData=${encodeURIComponent(eventJson)}&userID=1`;
+
+    const response = await callIngest(
+      test,
+      test.request(form, { headers: { "content-type": "application/x-www-form-urlencoded" } }),
+    );
+
+    expect(response.status).toBe(202);
+    expect(test.sent).toHaveLength(1);
+    expect(test.deleted).toHaveLength(0);
+    expect(test.stored.size).toBe(1);
+  });
+});
+
 describe("ingest: oversized media", () => {
   it("streams to R2 and enqueues a pointer with metadata, base64 excluded", async () => {
     const test = harness();

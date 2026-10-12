@@ -2,9 +2,6 @@
 /**
  * Creates cloudflare/<nomor>/ from _template/ and fills in every per-number
  * name, so adding a number is one command instead of a copy-paste chore.
- *
- *   pnpm run new -- --number 6281234567890
- *   pnpm run new -- --number 6281234567890 --bucket-prefix mybot-media --worker-prefix wuzapi
  */
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -65,7 +62,6 @@ function parseArgs(argv) {
             "  --kv-prefix <p>       KV namespace name prefix        (default WUZIPBOT_KNOWLEDGE)",
             "  --force               overwrite an existing folder",
             "",
-            "example: pnpm run new -- --number 6281234567890",
           ].join("\n"),
         );
         process.exit(0);
@@ -155,7 +151,7 @@ async function copyTemplate(sourceDir, targetDir, replacements) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (!options.number) {
-    console.error("error: --number is required, for example: pnpm run new -- --number 6281234567890");
+    console.error("error: --number is required");
     process.exit(1);
   }
 

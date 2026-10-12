@@ -2,13 +2,6 @@
 /**
  * Per-number wrangler commands, with the paths and flags this repository needs.
  *
- *   pnpm run dev       -- --number 6281234567890 [--port 8790]
- *   pnpm run deploy    -- --number 6281234567890
- *   pnpm run tail      -- --number 6281234567890
- *   pnpm run migrate   -- --number 6281234567890 [--local]
- *   pnpm run knowledge -- --number 6281234567890 --prompt <file> --knowledge <file>
- *   pnpm run secrets   -- --number 6281234567890 [options]
- *
  * Every instance folder is a deployable Worker project, so `--config` selects the
  * number; nothing is shared between numbers except the code in shared/.
  *

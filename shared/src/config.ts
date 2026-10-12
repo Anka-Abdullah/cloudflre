@@ -19,6 +19,8 @@ export interface Env {
 
   INLINE_MAX_BYTES?: string;
   MEDIA_BUFFER_MAX_BYTES?: string;
+  MEDIA_MAX_BYTES?: string;
+  ENVELOPE_MAX_BYTES?: string;
   SCAN_MAX_FIELD_BYTES?: string;
   HMAC_MODE?: string;
   MEDIA_MODE?: string;
@@ -193,6 +195,18 @@ export interface InstanceConfig {
   inlineMaxBytes: number;
   /** Cap for oversized bodies that arrive without Content-Length. */
   mediaBufferMaxBytes: number;
+  /**
+   * Hard ceiling for a media upload. Above this the request is refused with a 413
+   * *before* any of it is stored, instead of being streamed to R2 and truncated
+   * by the runtime partway through.
+   */
+  mediaMaxBytes: number;
+  /**
+   * Ceiling for a serialised envelope. Cloudflare rejects a queue message over
+   * 128 KB, so an event that would exceed this is offloaded to R2 and replaced by
+   * a pointer rather than being lost on send.
+   */
+  envelopeMaxBytes: number;
   scanMaxFieldBytes: number;
   retryBaseSeconds: number;
   retryMaxSeconds: number;
@@ -342,6 +356,10 @@ export function loadConfig(env: Env): InstanceConfig {
       100_000_000,
     ),
     scanMaxFieldBytes: intVar("SCAN_MAX_FIELD_BYTES", env.SCAN_MAX_FIELD_BYTES, 262_144, 1_024, 5_000_000),
+    mediaMaxBytes: intVar("MEDIA_MAX_BYTES", env.MEDIA_MAX_BYTES, 50_000_000, 1_000, 100_000_000),
+    // Below the 128 KB queue-message limit on purpose: the cap has to leave room
+    // for the envelope wrapper the JSON body is then wrapped in.
+    envelopeMaxBytes: intVar("ENVELOPE_MAX_BYTES", env.ENVELOPE_MAX_BYTES, 120_000, 10_000, 127_000),
     retryBaseSeconds: intVar("RETRY_BASE_SECONDS", env.RETRY_BASE_SECONDS, 15, 1, 3_600),
     retryMaxSeconds: intVar("RETRY_MAX_SECONDS", env.RETRY_MAX_SECONDS, 3_600, 1, 86_400),
     downstreamUrl: trimmed(env.DOWNSTREAM_URL),
